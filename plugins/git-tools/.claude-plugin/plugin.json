@@ -1,0 +1,20 @@
+{
+  "name": "git-tools",
+  "description": "Git 工作流工具集 — 自動分析 diff 產出 Conventional Commits 格式的 Commit Message、Branch Name、Git Label 與版本公告",
+  "version": "1.0.0",
+  "author": {
+    "name": "Cheng"
+  },
+  "license": "MIT",
+  "category": "productivity",
+  "skills": [
+    "./skills/diff-summary"
+  ],
+  "keywords": [
+    "git",
+    "diff",
+    "commit-message",
+    "conventional-commits",
+    "changelog"
+  ]
+}
