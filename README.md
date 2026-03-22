@@ -6,10 +6,10 @@
 
 ```bash
 # 加入 Marketplace
-claudec plugin marketplace add mark22013333/forge
+claude plugin marketplace add mark22013333/forge
 
 # 安裝 Plugin
-claudec plugin install git-tools
+claude plugin install git-tools
 ```
 
 安裝後**重啟 Claude Code** 使 Plugin 生效。
@@ -46,7 +46,7 @@ claudec plugin install git-tools
 ## 更新
 
 ```bash
-claudec plugin update git-tools@forge
+claude plugin update git-tools@forge
 ```
 
 ---
