@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "forge",
+  "description": "Forge — 通用開發工具集，提供 Git 工作流、程式碼分析等實用 Claude Code Plugins",
+  "owner": {
+    "name": "Cheng"
+  },
+  "plugins": [
+    {
+      "name": "git-tools",
+      "description": "Git 工作流工具集 — 自動分析 diff 產出 Conventional Commits 格式的 Commit Message、Branch Name、Git Label 與版本公告",
+      "version": "1.0.0",
+      "author": {
+        "name": "Cheng"
+      },
+      "source": "./plugins/git-tools",
+      "category": "productivity"
+    }
+  ]
+}
