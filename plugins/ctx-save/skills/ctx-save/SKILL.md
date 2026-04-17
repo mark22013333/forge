@@ -19,6 +19,7 @@ user_invocable: true
 | `/ctx-save list` | list | 列出所有快照摘要 |
 | `/ctx-save search <keyword>` | search | 搜尋歷史快照 |
 | `/ctx-save clean [N]` | clean | 清除 N 天前的快照（預設 30） |
+| `/ctx-save view` | view | 啟動 Web UI 視覺化瀏覽 SQLite 記錄 |
 
 ---
 
@@ -129,6 +130,25 @@ Context: 72% used (145k / 200k tokens)
 
 ---
 
+## View 模式（Web UI）
+
+啟動本地 HTTP Server 視覺化瀏覽 SQLite 記錄：
+
+```bash
+python3 {skill_dir}/scripts/ctx-viewer.py --open
+```
+
+參數說明：
+- `--db <path>`：指定 context.db 路徑（預設自動搜尋當前目錄往上）
+- `--port <N>`：指定 port（預設 8787）
+- `--open`：啟動後自動開啟瀏覽器
+
+功能：Session 列表、詳情檢視、分類篩選、關鍵字搜尋、統計圖表。純 Python 標準庫，無需安裝任何套件。
+
+執行此模式時，用 Bash 工具在背景啟動 server，然後告知使用者 URL。
+
+---
+
 ## 搭配 Hook 自動提醒
 
 可搭配 PostToolUse hook 在 context 超過閾值時自動提醒。安裝與設定方式見 `references/hook-setup.md`。
@@ -144,3 +164,4 @@ Context: 72% used (145k / 200k tokens)
 
 - **`scripts/ctx-db.py`** — SQLite 資料庫操作（init / save / list / get / search / clean）
 - **`scripts/ctx-alert.sh`** — PostToolUse hook 提醒腳本（含冷卻機制）
+- **`scripts/ctx-viewer.py`** — Web UI 視覺化伺服器（純 Python 標準庫，port 8787）
