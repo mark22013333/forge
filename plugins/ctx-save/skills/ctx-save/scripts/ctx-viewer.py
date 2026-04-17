@@ -28,7 +28,9 @@ SERVICE_NAME = "ctx-viewer"
 VERSION = "2.0.0"
 STARTED_AT = None  # main() 會初始化為 ISO8601 字串
 
-HTML_PAGE = """<!DOCTYPE html>
+# NOTE: raw string 防止 Python 把 JS 內的 \n \t 等 escape 解譯成真實字元
+#       新增 JS 時若需要反斜線語意，記得照常寫（\n 會原樣送到瀏覽器）
+HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="zh-TW">
 <head>
 <meta charset="UTF-8">
