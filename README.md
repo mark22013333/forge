@@ -1,15 +1,16 @@
 # Forge — Claude Code Plugin Marketplace
 
-通用開發工具集，提供 Git 工作流、程式碼分析等實用 Skill。
+通用開發工具集，提供 Git 工作流、對話重點快照等實用 Plugin。
 
 ## 快速安裝
 
 ```bash
-# 加入 Marketplace
+# 加入 Marketplace（只需一次）
 claude plugin marketplace add mark22013333/forge
 
-# 安裝 Plugin
+# 安裝需要的 Plugin
 claude plugin install git-tools
+claude plugin install ctx-save
 ```
 
 安裝後**重啟 Claude Code** 使 Plugin 生效。
@@ -26,7 +27,7 @@ claude plugin install git-tools
 |-------|------|---------|
 | `diff-summary` | 分析 git diff 產出完整 Commit Message | 「分析 diff」「產生 commit message」「寫 commit」「變更摘要」 |
 
-**功能特點：**
+**功能特點**
 
 - 自動過濾設定檔（application-*.yml、pom.xml、*.properties）
 - 大型 diff（>3000 行）自動切換逐檔分析模式
@@ -34,19 +35,52 @@ claude plugin install git-tools
 - 同時產出繁體中文與英文版本
 - 附帶版本公告 JSON，供非技術人員閱讀
 
-**支援參數：**
+**支援參數**
 
 ```
 --cached           只分析已 staged 的變更
 --branch <name>    與指定分支比較
 ```
 
+安裝：
+```bash
+claude plugin install git-tools
+```
+
+---
+
+### ctx-save — 對話重點快照 + Web Viewer
+
+在 Claude Code 自動壓縮前保存對話重點。支援 Markdown 與 SQLite 儲存、PostToolUse Hook 自動提醒、Web Viewer 視覺化瀏覽。
+
+| Skill | 類型 | 說明 |
+|-------|------|------|
+| `ctx-save` | 手動 | `/ctx-save` 把當前對話重點寫入 SQLite + Markdown |
+| `ctx-view` | User-invocable | `/ctx-view` 背景啟動 Web Viewer（預設 `http://127.0.0.1:29898`） |
+| `ctx-view-stop` | User-invocable | `/ctx-view-stop` 優雅停止 Web Viewer |
+
+**功能特點**
+
+- 純 Python 標準庫，無任何 pip 依賴
+- Web UI：瀏覽 / 搜尋 / 刪除 / 複製（內容 & 含 frontmatter 的 Markdown）
+- 批次刪除 Modal（依分類 + 日期範圍預覽後執行）
+- Port 衝突自動遞增 + lsof 診斷占用者
+- Server 重用判斷：PID file + `/api/ping` 雙保險
+- Context 超過閾值時 PostToolUse hook 自動提醒
+
+安裝：
+```bash
+claude plugin install ctx-save
+```
+
+詳細使用方式：[plugins/ctx-save/README.md](plugins/ctx-save/README.md)
+
 ---
 
 ## 更新
 
 ```bash
-claude plugin update git-tools@forge
+claude plugin update <plugin-name>@forge
 ```
 
 ---

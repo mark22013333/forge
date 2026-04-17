@@ -140,7 +140,7 @@ python3 {skill_dir}/scripts/ctx-viewer.py --open
 
 參數說明：
 - `--db <path>`：指定 context.db 路徑（預設自動搜尋當前目錄往上）
-- `--port <N>`：指定 port（預設 8787）
+- `--port <N>`：指定 port（預設 29898）
 - `--open`：啟動後自動開啟瀏覽器
 
 功能：Session 列表、詳情檢視、分類篩選、關鍵字搜尋、統計圖表。純 Python 標準庫，無需安裝任何套件。
@@ -164,4 +164,4 @@ python3 {skill_dir}/scripts/ctx-viewer.py --open
 
 - **`scripts/ctx-db.py`** — SQLite 資料庫操作（init / save / list / get / search / clean）
 - **`scripts/ctx-alert.sh`** — PostToolUse hook 提醒腳本（含冷卻機制）
-- **`scripts/ctx-viewer.py`** — Web UI 視覺化伺服器（純 Python 標準庫，port 8787）
+- **`scripts/ctx-viewer.py`** — Web UI 視覺化伺服器（純 Python 標準庫，port 29898）
