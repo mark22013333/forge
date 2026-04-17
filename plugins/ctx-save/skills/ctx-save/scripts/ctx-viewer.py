@@ -4,23 +4,29 @@
 啟動方式:
     python3 ctx-viewer.py                          # 自動搜尋當前目錄的 .ctx-save/context.db
     python3 ctx-viewer.py --db /path/to/context.db  # 指定 DB 路徑
-    python3 ctx-viewer.py --port 8787               # 指定 port（預設 8787）
+    python3 ctx-viewer.py --port 29898               # 指定 port（預設 29898）
     python3 ctx-viewer.py --open                    # 啟動後自動開啟瀏覽器
 
 無需任何外部依賴，僅使用 Python 標準庫。
 """
 
 import argparse
+import importlib.util
 import json
 import os
 import sqlite3
 import sys
 import webbrowser
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
+# 全域設定（供 /api/ping 與各 Handler 共用）
 DB_PATH = None
+SERVICE_NAME = "ctx-viewer"
+VERSION = "2.0.0"
+STARTED_AT = None  # main() 會初始化為 ISO8601 字串
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="zh-TW">
@@ -65,8 +71,16 @@ HTML_PAGE = """<!DOCTYPE html>
   }
   .search-box:focus { border-color: var(--accent); }
   .search-box::placeholder { color: var(--text2); }
-  .header-stats { display: flex; gap: 16px; margin-left: auto; font-size: 13px; color: var(--text2); }
+  .header-stats { display: flex; gap: 16px; font-size: 13px; color: var(--text2); }
   .header-stats strong { color: var(--text); }
+
+  /* Header 批次刪除按鈕 */
+  .btn-batch-delete {
+    background: transparent; border: 1px solid var(--border);
+    color: var(--danger); padding: 6px 12px; border-radius: var(--radius);
+    font-size: 13px; cursor: pointer; transition: background 0.15s;
+  }
+  .btn-batch-delete:hover { background: rgba(248, 81, 73, 0.1); }
 
   /* Layout */
   .main { display: flex; flex: 1; overflow: hidden; }
@@ -119,6 +133,10 @@ HTML_PAGE = """<!DOCTYPE html>
   .empty-state .icon { font-size: 48px; opacity: 0.5; }
   .detail-header { margin-bottom: 24px; }
   .detail-header h2 { font-size: 22px; margin-bottom: 8px; }
+  .detail-header-top {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    margin-bottom: 8px;
+  }
   .detail-meta { font-size: 13px; color: var(--text2); display: flex; gap: 16px; flex-wrap: wrap; }
 
   .record-card {
@@ -145,6 +163,29 @@ HTML_PAGE = """<!DOCTYPE html>
     border-radius: 12px; background: #1f2a3d; color: var(--accent);
     margin-right: 4px;
   }
+
+  /* 記錄操作按鈕列 */
+  .record-actions {
+    padding: 8px 16px; border-top: 1px solid var(--border);
+    display: flex; gap: 8px; flex-wrap: wrap;
+  }
+  .btn-action {
+    background: transparent; border: 1px solid var(--border);
+    padding: 4px 10px; border-radius: 4px; font-size: 12px;
+    cursor: pointer; transition: background 0.15s;
+    color: var(--text2);
+  }
+  .btn-action:hover { background: var(--surface2); color: var(--text); }
+  .btn-action.btn-delete { color: var(--danger); }
+  .btn-action.btn-delete:hover { background: rgba(248, 81, 73, 0.1); color: var(--danger); }
+
+  /* 整個 session 刪除按鈕 */
+  .btn-delete-session {
+    background: transparent; border: 1px solid var(--border);
+    color: var(--danger); padding: 6px 12px; border-radius: var(--radius);
+    font-size: 13px; cursor: pointer; transition: background 0.15s;
+  }
+  .btn-delete-session:hover { background: rgba(248, 81, 73, 0.1); }
 
   /* Stats view */
   .stats-grid {
@@ -194,6 +235,90 @@ HTML_PAGE = """<!DOCTYPE html>
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
   ::-webkit-scrollbar-thumb:hover { background: var(--text2); }
 
+  /* Modal（批次刪除面板） */
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(0, 0, 0, 0.7);
+    display: none; align-items: center; justify-content: center;
+    z-index: 500;
+  }
+  .modal-overlay.show { display: flex; }
+  .modal-content {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 24px;
+    min-width: 420px; max-width: 560px;
+  }
+  .modal-title {
+    font-size: 16px; font-weight: 600; margin-bottom: 16px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .modal-close {
+    margin-left: auto; background: transparent; border: none; color: var(--text2);
+    font-size: 20px; cursor: pointer; line-height: 1;
+  }
+  .modal-close:hover { color: var(--text); }
+  .form-group { margin-bottom: 12px; }
+  .form-group label {
+    display: block; font-size: 12px; color: var(--text2); margin-bottom: 4px;
+  }
+  .form-group select,
+  .form-group input {
+    width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 8px 10px; font-size: 13px; outline: none;
+  }
+  .form-group select:focus,
+  .form-group input:focus { border-color: var(--accent); }
+  .modal-hint {
+    font-size: 12px; color: var(--text2); margin-bottom: 12px;
+    padding: 8px 10px; background: var(--bg); border-radius: 4px;
+  }
+  .modal-preview {
+    font-size: 13px; color: var(--accent); margin: 12px 0;
+    padding: 10px 12px; background: var(--bg); border-radius: 4px;
+    border: 1px solid var(--border);
+  }
+  .modal-actions {
+    display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px;
+  }
+  .btn-primary,
+  .btn-secondary,
+  .btn-danger {
+    padding: 8px 14px; border-radius: var(--radius); font-size: 13px;
+    cursor: pointer; border: 1px solid var(--border); transition: all 0.15s;
+  }
+  .btn-secondary { background: transparent; color: var(--text2); }
+  .btn-secondary:hover { background: var(--surface2); color: var(--text); }
+  .btn-primary { background: transparent; color: var(--accent); border-color: var(--accent); }
+  .btn-primary:hover { background: rgba(88, 166, 255, 0.1); }
+  .btn-danger { background: transparent; color: var(--danger); border-color: var(--danger); }
+  .btn-danger:hover { background: rgba(248, 81, 73, 0.1); }
+  .btn-danger:disabled,
+  .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Toast */
+  .toast-container {
+    position: fixed; bottom: 20px; right: 20px;
+    display: flex; flex-direction: column; gap: 8px;
+    z-index: 1000;
+  }
+  .toast {
+    background: var(--surface); border: 1px solid var(--accent2);
+    color: var(--text); padding: 10px 14px; border-radius: var(--radius);
+    font-size: 13px; min-width: 200px; max-width: 360px;
+    animation: toast-in 0.2s ease;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  }
+  .toast.error { border-color: var(--danger); }
+  .toast.warn { border-color: var(--warn); }
+  .toast.fade-out { animation: toast-out 0.3s ease forwards; }
+  @keyframes toast-in {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes toast-out {
+    to { opacity: 0; transform: translateY(10px); }
+  }
+
   @media (max-width: 768px) {
     .main { flex-direction: column; }
     .sidebar { width: 100%; min-width: unset; max-height: 40vh; }
@@ -206,6 +331,7 @@ HTML_PAGE = """<!DOCTYPE html>
   <h1><span>&#9881;</span> Context Save Viewer</h1>
   <input class="search-box" type="text" placeholder="搜尋關鍵字..." id="searchInput">
   <div class="header-stats" id="headerStats"></div>
+  <button class="btn-batch-delete" onclick="openBatchDeleteModal()">&#128465; 批次刪除</button>
 </div>
 
 <div class="tabs">
@@ -237,6 +363,41 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 </div>
 
+<!-- 批次刪除 Modal -->
+<div class="modal-overlay" id="batchDeleteModal" onclick="onModalOverlayClick(event)">
+  <div class="modal-content" onclick="event.stopPropagation()">
+    <div class="modal-title">
+      <span>&#128465;</span>
+      <span>批次刪除記錄</span>
+      <button class="modal-close" onclick="closeBatchDeleteModal()">&times;</button>
+    </div>
+    <div class="modal-hint">至少指定一個條件（分類 / 早於 / 晚於）才可執行刪除。</div>
+    <div class="form-group">
+      <label>分類</label>
+      <select id="batchCategory">
+        <option value="">（全部）</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>早於（created_at &lt;）</label>
+      <input type="date" id="batchBefore">
+    </div>
+    <div class="form-group">
+      <label>晚於（created_at &gt;=）</label>
+      <input type="date" id="batchAfter">
+    </div>
+    <div class="modal-preview" id="batchPreview" style="display: none;"></div>
+    <div class="modal-actions">
+      <button class="btn-secondary" onclick="closeBatchDeleteModal()">取消</button>
+      <button class="btn-primary" id="btnBatchPreview" onclick="previewBatchDelete()">預覽筆數</button>
+      <button class="btn-danger" id="btnBatchConfirm" onclick="confirmBatchDelete()" disabled>確認刪除</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast container -->
+<div class="toast-container" id="toastContainer"></div>
+
 <script>
 const CATEGORY_MAP = {
   task: { emoji: '📋', label: '任務進度' },
@@ -251,10 +412,18 @@ const CATEGORY_MAP = {
 
 let allSessions = [];
 let allRecords = {};
+let currentSessionId = null;
+let batchPreviewCount = null; // 預覽過才開放確認刪除
 
 async function fetchAPI(endpoint) {
   const res = await fetch('/api/' + endpoint);
   return res.json();
+}
+
+async function fetchJSON(url, opts = {}) {
+  const res = await fetch(url, opts);
+  const data = await res.json().catch(() => ({ ok: false, error: 'invalid JSON response' }));
+  return { status: res.status, data };
 }
 
 function formatDate(dateStr) {
@@ -272,18 +441,35 @@ function ctxBadgeClass(pct) {
 
 function escapeHtml(text) {
   const div = document.createElement('div');
-  div.textContent = text;
+  div.textContent = text == null ? '' : String(text);
   return div.innerHTML;
 }
 
+/* ========== Toast 機制 ========== */
+function showToast(msg, type = 'success') {
+  const container = document.getElementById('toastContainer');
+  const toast = document.createElement('div');
+  toast.className = 'toast' + (type === 'error' ? ' error' : type === 'warn' ? ' warn' : '');
+  toast.textContent = msg;
+  container.appendChild(toast);
+  setTimeout(() => {
+    toast.classList.add('fade-out');
+    setTimeout(() => toast.remove(), 300);
+  }, 2000);
+}
+
+/* ========== Sessions 載入與渲染 ========== */
 async function loadSessions() {
   const data = await fetchAPI('sessions');
   allSessions = data.sessions || [];
+  allRecords = {}; // 清掉快取，確保刪除後不會顯示舊資料
   const categories = new Set();
   allSessions.forEach(s => {
     (s.categories || '').split(',').forEach(c => { if (c.trim()) categories.add(c.trim()); });
   });
   const select = document.getElementById('categoryFilter');
+  // 清空後重建（除了第一個「全部類別」選項）
+  while (select.options.length > 1) select.remove(1);
   categories.forEach(c => {
     const cat = CATEGORY_MAP[c] || { emoji: '📌', label: c };
     const opt = document.createElement('option');
@@ -324,7 +510,7 @@ function filterSessions() {
     const ctxPct = s.context_percentage || 0;
     const title = (s.titles || '').split(' | ')[0] || s.session_id.slice(0, 12);
     return `
-      <div class="session-item" data-id="${s.session_id}" onclick="selectSession('${s.session_id}')">
+      <div class="session-item" data-id="${escapeHtml(s.session_id)}" onclick="selectSession('${escapeHtml(s.session_id)}')">
         <div class="session-date">${formatDate(s.created_at)}</div>
         <div class="session-title">${escapeHtml(title)}</div>
         <div class="session-meta">
@@ -338,6 +524,7 @@ function filterSessions() {
 }
 
 async function selectSession(sessionId) {
+  currentSessionId = sessionId;
   document.querySelectorAll('.session-item').forEach(el => {
     el.classList.toggle('active', el.dataset.id === sessionId);
   });
@@ -349,6 +536,10 @@ async function selectSession(sessionId) {
     allRecords[sessionId] = records;
   }
 
+  renderSessionDetail(sessionId, records);
+}
+
+function renderSessionDetail(sessionId, records) {
   const content = document.getElementById('contentPanel');
   if (!records.length) {
     content.innerHTML = '<div class="empty-state"><div class="icon">&#128196;</div><div>此 session 無記錄</div></div>';
@@ -358,7 +549,10 @@ async function selectSession(sessionId) {
   const first = records[0];
   const header = `
     <div class="detail-header">
-      <h2>${escapeHtml(first.title || sessionId)}</h2>
+      <div class="detail-header-top">
+        <h2>${escapeHtml(first.title || sessionId)}</h2>
+        <button class="btn-delete-session" onclick="deleteSession('${escapeHtml(sessionId)}')">&#128465; 刪除整個 session</button>
+      </div>
       <div class="detail-meta">
         <span>&#128197; ${formatDate(first.created_at)}</span>
         <span>&#129302; ${escapeHtml(first.model || 'N/A')}</span>
@@ -374,8 +568,9 @@ async function selectSession(sessionId) {
       `<span class="tag">${escapeHtml(t.trim())}</span>`
     ).join('');
     const tagsSection = tags ? `<div class="record-tags">${tags}</div>` : '';
+    // 用 data-id 標記列，刪除後可從 DOM 移除
     return `
-      <div class="record-card">
+      <div class="record-card" data-record-id="${r.id}">
         <div class="record-header">
           <span class="emoji">${cat.emoji}</span>
           <span>${cat.label}</span>
@@ -383,6 +578,11 @@ async function selectSession(sessionId) {
         </div>
         <div class="record-body">${escapeHtml(r.content)}</div>
         ${tagsSection}
+        <div class="record-actions">
+          <button class="btn-action btn-delete" onclick="deleteRecord(${r.id})">&#128465; 刪除</button>
+          <button class="btn-action" onclick="copyContent(${r.id})">&#128203; 複製內容</button>
+          <button class="btn-action" onclick="copyMarkdown(${r.id})">&#128203; 複製 MD</button>
+        </div>
       </div>
     `;
   }).join('');
@@ -390,6 +590,200 @@ async function selectSession(sessionId) {
   content.innerHTML = header + cards;
 }
 
+/* ========== 刪除操作 ========== */
+async function deleteRecord(id) {
+  if (!confirm('確定刪除此筆記錄？')) return;
+  const { status, data } = await fetchJSON(`/api/saves/${id}`, { method: 'DELETE' });
+  if (status === 200 && data.ok) {
+    // 從 DOM 移除該列
+    const card = document.querySelector(`.record-card[data-record-id="${id}"]`);
+    if (card) card.remove();
+    // 更新快取
+    if (currentSessionId && allRecords[currentSessionId]) {
+      allRecords[currentSessionId] = allRecords[currentSessionId].filter(r => r.id !== id);
+    }
+    const modeMsg = data.mode === 'soft' ? '已軟刪除（DB 忙碌中）' : '已刪除';
+    showToast(`✅ ${modeMsg}`, data.mode === 'soft' ? 'warn' : 'success');
+  } else if (status === 404) {
+    showToast('❌ 記錄不存在', 'error');
+  } else {
+    showToast('❌ 刪除失敗：' + (data.error || '未知錯誤'), 'error');
+  }
+}
+
+async function deleteSession(sessionId) {
+  if (!confirm(`確定刪除整個 session 的所有記錄？\n\nSession ID: ${sessionId}`)) return;
+  const { status, data } = await fetchJSON(`/api/session/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+  if (status === 200 && data.ok) {
+    const modeMsg = data.mode === 'soft' ? '已軟刪除' : '已刪除';
+    showToast(`✅ ${modeMsg} ${data.affected} 筆記錄`, data.mode === 'soft' ? 'warn' : 'success');
+    // 重載 sessions 列表
+    await loadSessions();
+    // 清空內容區
+    currentSessionId = null;
+    document.getElementById('contentPanel').innerHTML = `
+      <div class="empty-state">
+        <div class="icon">&#128203;</div>
+        <div>選擇左側的 session 查看詳情</div>
+      </div>
+    `;
+  } else if (status === 404) {
+    showToast('❌ Session 不存在', 'error');
+  } else {
+    showToast('❌ 刪除失敗：' + (data.error || '未知錯誤'), 'error');
+  }
+}
+
+/* ========== 複製操作 ========== */
+function findRecordById(id) {
+  for (const sid in allRecords) {
+    const r = allRecords[sid].find(rec => rec.id === id);
+    if (r) return r;
+  }
+  return null;
+}
+
+async function copyToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (e) {
+    // Fallback：用 prompt 顯示讓使用者手動複製
+    try {
+      prompt('請手動複製（navigator.clipboard 無法使用）:', text);
+      return true;
+    } catch (e2) {
+      return false;
+    }
+  }
+}
+
+async function copyContent(id) {
+  const r = findRecordById(id);
+  if (!r) { showToast('❌ 找不到記錄', 'error'); return; }
+  const ok = await copyToClipboard(r.content || '');
+  if (ok) showToast('✅ 已複製內容');
+  else showToast('❌ 複製失敗', 'error');
+}
+
+async function copyMarkdown(id) {
+  const r = findRecordById(id);
+  if (!r) { showToast('❌ 找不到記錄', 'error'); return; }
+  const md = [
+    '---',
+    `title: ${r.title || ''}`,
+    `category: ${r.category || ''}`,
+    `tags: ${r.tags || ''}`,
+    `context_percentage: ${r.context_percentage || 0}%`,
+    `session_id: ${r.session_id || currentSessionId || ''}`,
+    `created_at: ${r.created_at || ''}`,
+    `model: ${r.model || ''}`,
+    '---',
+    '',
+    r.content || '',
+  ].join('\n');
+  const ok = await copyToClipboard(md);
+  if (ok) showToast('✅ 已複製 Markdown');
+  else showToast('❌ 複製失敗', 'error');
+}
+
+/* ========== 批次刪除 Modal ========== */
+async function openBatchDeleteModal() {
+  // 從 /api/stats 取得 categories，填入下拉
+  const stats = await fetchAPI('stats');
+  const select = document.getElementById('batchCategory');
+  while (select.options.length > 1) select.remove(1);
+  const cats = Object.keys(stats.categories || {});
+  cats.forEach(c => {
+    const cat = CATEGORY_MAP[c] || { emoji: '📌', label: c };
+    const opt = document.createElement('option');
+    opt.value = c;
+    opt.textContent = `${cat.emoji} ${cat.label} (${stats.categories[c]})`;
+    select.appendChild(opt);
+  });
+  // 重置
+  document.getElementById('batchBefore').value = '';
+  document.getElementById('batchAfter').value = '';
+  document.getElementById('batchPreview').style.display = 'none';
+  document.getElementById('btnBatchConfirm').disabled = true;
+  batchPreviewCount = null;
+
+  document.getElementById('batchDeleteModal').classList.add('show');
+}
+
+function closeBatchDeleteModal() {
+  document.getElementById('batchDeleteModal').classList.remove('show');
+}
+
+function onModalOverlayClick(e) {
+  if (e.target.id === 'batchDeleteModal') closeBatchDeleteModal();
+}
+
+function collectBatchFilter() {
+  const category = document.getElementById('batchCategory').value || null;
+  const beforeDate = document.getElementById('batchBefore').value;
+  const afterDate = document.getElementById('batchAfter').value;
+  const before = beforeDate ? `${beforeDate}T00:00:00Z` : null;
+  const after = afterDate ? `${afterDate}T00:00:00Z` : null;
+  return { category, before, after };
+}
+
+async function previewBatchDelete() {
+  const filter = collectBatchFilter();
+  if (!filter.category && !filter.before && !filter.after) {
+    showToast('❌ 請至少指定一個條件', 'error');
+    return;
+  }
+  const { status, data } = await fetchJSON('/api/saves/batch-delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...filter, dry_run: true }),
+  });
+  const preview = document.getElementById('batchPreview');
+  if (status === 200 && data.ok) {
+    batchPreviewCount = data.affected || 0;
+    preview.textContent = `將刪除 ${batchPreviewCount} 筆記錄`;
+    preview.style.display = 'block';
+    document.getElementById('btnBatchConfirm').disabled = batchPreviewCount === 0;
+  } else {
+    preview.style.display = 'none';
+    batchPreviewCount = null;
+    document.getElementById('btnBatchConfirm').disabled = true;
+    showToast('❌ 預覽失敗：' + (data.error || '未知錯誤'), 'error');
+  }
+}
+
+async function confirmBatchDelete() {
+  if (batchPreviewCount == null) {
+    showToast('❌ 請先預覽筆數', 'error');
+    return;
+  }
+  if (!confirm(`確定刪除 ${batchPreviewCount} 筆記錄？此動作無法復原。`)) return;
+  const filter = collectBatchFilter();
+  const { status, data } = await fetchJSON('/api/saves/batch-delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...filter, dry_run: false }),
+  });
+  if (status === 200 && data.ok) {
+    const modeMsg = data.mode === 'soft' ? '已軟刪除' : '已刪除';
+    showToast(`✅ ${modeMsg} ${data.affected} 筆記錄`, data.mode === 'soft' ? 'warn' : 'success');
+    closeBatchDeleteModal();
+    // 重整 sessions 列表
+    await loadSessions();
+    currentSessionId = null;
+    document.getElementById('contentPanel').innerHTML = `
+      <div class="empty-state">
+        <div class="icon">&#128203;</div>
+        <div>選擇左側的 session 查看詳情</div>
+      </div>
+    `;
+  } else {
+    showToast('❌ 刪除失敗：' + (data.error || '未知錯誤'), 'error');
+  }
+}
+
+/* ========== Stats Tab ========== */
 async function renderStats() {
   const data = await fetchAPI('stats');
   const content = document.getElementById('contentPanel');
@@ -488,10 +882,13 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def get_db(self):
+        """取得 SQLite 連線（row_factory + 1 秒 busy_timeout）"""
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 1000")
         return conn
 
+    # ======================= GET =======================
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -500,8 +897,19 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/" or path == "/index.html":
             self.send_html(HTML_PAGE)
 
+        elif path == "/api/ping":
+            # 健康檢查端點，供 launcher 判斷既有服務是否為本 plugin
+            self.send_json({
+                "ok": True,
+                "service": SERVICE_NAME,
+                "version": VERSION,
+                "db": DB_PATH,
+                "started_at": STARTED_AT,
+            })
+
         elif path == "/api/sessions":
             conn = self.get_db()
+            # 所有 SELECT 都過濾 deleted_at IS NULL
             rows = conn.execute("""
                 SELECT
                     session_id,
@@ -511,10 +919,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                     COUNT(*) as item_count,
                     GROUP_CONCAT(title, ' | ') as titles
                 FROM context_saves
+                WHERE deleted_at IS NULL
                 GROUP BY session_id
                 ORDER BY created_at DESC
             """).fetchall()
-            total = conn.execute("SELECT COUNT(*) FROM context_saves").fetchone()[0]
+            total = conn.execute(
+                "SELECT COUNT(*) FROM context_saves WHERE deleted_at IS NULL"
+            ).fetchone()[0]
             conn.close()
             sessions = [dict(r) for r in rows]
             self.send_json({"sessions": sessions, "total_records": total})
@@ -523,9 +934,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             session_id = path.split("/api/session/", 1)[1]
             conn = self.get_db()
             rows = conn.execute("""
-                SELECT category, title, content, tags, context_percentage, created_at, model
+                SELECT id, session_id, category, title, content, tags,
+                       context_percentage, created_at, model
                 FROM context_saves
-                WHERE session_id = ?
+                WHERE session_id = ? AND deleted_at IS NULL
                 ORDER BY id
             """, (session_id,)).fetchall()
             conn.close()
@@ -533,13 +945,23 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/stats":
             conn = self.get_db()
-            total = conn.execute("SELECT COUNT(*) FROM context_saves").fetchone()[0]
-            sessions = conn.execute("SELECT COUNT(DISTINCT session_id) FROM context_saves").fetchone()[0]
-            categories = dict(conn.execute(
-                "SELECT category, COUNT(*) FROM context_saves GROUP BY category ORDER BY COUNT(*) DESC"
-            ).fetchall())
-            oldest = conn.execute("SELECT MIN(created_at) FROM context_saves").fetchone()[0]
-            newest = conn.execute("SELECT MAX(created_at) FROM context_saves").fetchone()[0]
+            total = conn.execute(
+                "SELECT COUNT(*) FROM context_saves WHERE deleted_at IS NULL"
+            ).fetchone()[0]
+            sessions = conn.execute(
+                "SELECT COUNT(DISTINCT session_id) FROM context_saves WHERE deleted_at IS NULL"
+            ).fetchone()[0]
+            categories = dict(conn.execute("""
+                SELECT category, COUNT(*) FROM context_saves
+                WHERE deleted_at IS NULL
+                GROUP BY category ORDER BY COUNT(*) DESC
+            """).fetchall())
+            oldest = conn.execute(
+                "SELECT MIN(created_at) FROM context_saves WHERE deleted_at IS NULL"
+            ).fetchone()[0]
+            newest = conn.execute(
+                "SELECT MAX(created_at) FROM context_saves WHERE deleted_at IS NULL"
+            ).fetchone()[0]
             conn.close()
             self.send_json({
                 "total_records": total,
@@ -557,9 +979,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             conn = self.get_db()
             like = f"%{keyword}%"
             rows = conn.execute("""
-                SELECT session_id, created_at, category, title, content
+                SELECT id, session_id, created_at, category, title, content
                 FROM context_saves
-                WHERE title LIKE ? OR content LIKE ? OR tags LIKE ?
+                WHERE (title LIKE ? OR content LIKE ? OR tags LIKE ?)
+                  AND deleted_at IS NULL
                 ORDER BY created_at DESC LIMIT 50
             """, (like, like, like)).fetchall()
             conn.close()
@@ -568,6 +991,200 @@ class RequestHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
+
+    # ======================= DELETE =======================
+    def do_DELETE(self):
+        """
+        路由：
+          - DELETE /api/saves/{id}            → 刪除單筆
+          - DELETE /api/session/{session_id}  → 刪除整個 session
+        """
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path.startswith("/api/saves/"):
+            id_str = path.split("/api/saves/", 1)[1]
+            try:
+                save_id = int(id_str)
+            except ValueError:
+                self.send_json({"ok": False, "error": "invalid id"}, status=400)
+                return
+            status, body = self._delete_with_fallback(
+                where_sql="id = ?",
+                params=(save_id,),
+            )
+            if status == 200 and body.get("ok"):
+                body["id"] = save_id
+            self.send_json(body, status=status)
+            return
+
+        if path.startswith("/api/session/"):
+            session_id = path.split("/api/session/", 1)[1]
+            if not session_id:
+                self.send_json({"ok": False, "error": "session_id required"}, status=400)
+                return
+            status, body = self._delete_with_fallback(
+                where_sql="session_id = ?",
+                params=(session_id,),
+                is_session=True,
+            )
+            if status == 200 and body.get("ok"):
+                body["session_id"] = session_id
+            self.send_json(body, status=status)
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    # ======================= POST =======================
+    def do_POST(self):
+        """路由：POST /api/saves/batch-delete"""
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/saves/batch-delete":
+            self._handle_batch_delete()
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    # ======================= 內部輔助方法 =======================
+    def _delete_with_fallback(self, where_sql, params, is_session=False):
+        """
+        共用的 hard → soft 降級刪除邏輯。
+
+        Args:
+            where_sql: WHERE 子句（不含 WHERE 關鍵字）
+            params: 對應的參數 tuple
+            is_session: True 表示整個 session 刪除（rowcount 不代表存在）
+
+        Returns:
+            (status_code, response_body_dict)
+        """
+        conn = self.get_db()
+        try:
+            try:
+                cur = conn.execute(
+                    f"DELETE FROM context_saves WHERE {where_sql}",
+                    params,
+                )
+                affected = cur.rowcount
+                conn.commit()
+                if affected == 0:
+                    return 404, {"ok": False, "error": "record not found"}
+                return 200, {"ok": True, "mode": "hard", "affected": affected}
+            except sqlite3.OperationalError as e:
+                # DB 唯讀 / locked → 軟刪除 fallback
+                cur = conn.execute(
+                    f"UPDATE context_saves SET deleted_at = CURRENT_TIMESTAMP "
+                    f"WHERE ({where_sql}) AND deleted_at IS NULL",
+                    params,
+                )
+                affected = cur.rowcount
+                conn.commit()
+                if affected == 0:
+                    return 404, {"ok": False, "error": "record not found"}
+                return 200, {
+                    "ok": True,
+                    "mode": "soft",
+                    "affected": affected,
+                    "reason": str(e),
+                }
+        finally:
+            conn.close()
+
+    def _handle_batch_delete(self):
+        """處理 POST /api/saves/batch-delete"""
+        # 1. 讀 body
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            raw = self.rfile.read(length) if length > 0 else b""
+            body = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, json.JSONDecodeError) as e:
+            self.send_json({"ok": False, "error": f"invalid JSON body: {e}"}, status=400)
+            return
+
+        category = body.get("category")
+        before = body.get("before")
+        after = body.get("after")
+        dry_run = bool(body.get("dry_run", False))
+
+        # 2. 驗證至少一個條件
+        if not category and not before and not after:
+            self.send_json(
+                {"ok": False, "error": "at least one of category/before/after is required"},
+                status=400,
+            )
+            return
+
+        # 3. 動態組 WHERE
+        where_parts = ["deleted_at IS NULL"]
+        params = []
+        if category:
+            where_parts.append("category = ?")
+            params.append(category)
+        if before:
+            where_parts.append("created_at < ?")
+            params.append(before)
+        if after:
+            where_parts.append("created_at >= ?")
+            params.append(after)
+        where_sql = " AND ".join(where_parts)
+        filter_dict = {}
+        if category: filter_dict["category"] = category
+        if before: filter_dict["before"] = before
+        if after: filter_dict["after"] = after
+
+        conn = self.get_db()
+        try:
+            # 4. Dry run：只 SELECT COUNT
+            if dry_run:
+                count = conn.execute(
+                    f"SELECT COUNT(*) FROM context_saves WHERE {where_sql}",
+                    params,
+                ).fetchone()[0]
+                self.send_json({
+                    "ok": True,
+                    "dry_run": True,
+                    "affected": count,
+                    "filter": filter_dict,
+                })
+                return
+
+            # 5. 實際執行：hard → soft fallback
+            try:
+                cur = conn.execute(
+                    f"DELETE FROM context_saves WHERE {where_sql}",
+                    params,
+                )
+                affected = cur.rowcount
+                conn.commit()
+                self.send_json({
+                    "ok": True,
+                    "dry_run": False,
+                    "mode": "hard",
+                    "affected": affected,
+                    "filter": filter_dict,
+                })
+            except sqlite3.OperationalError as e:
+                cur = conn.execute(
+                    f"UPDATE context_saves SET deleted_at = CURRENT_TIMESTAMP "
+                    f"WHERE {where_sql}",
+                    params,
+                )
+                affected = cur.rowcount
+                conn.commit()
+                self.send_json({
+                    "ok": True,
+                    "dry_run": False,
+                    "mode": "soft",
+                    "affected": affected,
+                    "reason": str(e),
+                    "filter": filter_dict,
+                })
+        finally:
+            conn.close()
 
 
 def find_db():
@@ -584,14 +1201,38 @@ def find_db():
     return None
 
 
+def _run_migration():
+    """啟動前執行 schema migration（冪等）。
+
+    因 ctx-db.py 檔名含連字號無法用 import 語法，改用 importlib 動態載入。
+    """
+    try:
+        spec_ = importlib.util.spec_from_file_location(
+            "ctx_db", Path(__file__).parent / "ctx-db.py"
+        )
+        ctx_db = importlib.util.module_from_spec(spec_)
+        spec_.loader.exec_module(ctx_db)
+    except Exception as e:
+        print(f"  ⚠ 無法載入 ctx-db.py（跳過 migration）: {e}")
+        return
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        if ctx_db.migrate_add_deleted_at(conn):
+            print("  ✓ 資料庫已升級（新增 deleted_at 欄位）")
+        conn.close()
+    except Exception as e:
+        print(f"  ⚠ Migration 執行失敗（繼續啟動）: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Context Save 視覺化 Web Server")
     parser.add_argument("--db", help="SQLite 資料庫路徑")
-    parser.add_argument("--port", type=int, default=8787, help="HTTP port（預設 8787）")
+    parser.add_argument("--port", type=int, default=29898, help="HTTP port（預設 29898）")
     parser.add_argument("--open", action="store_true", help="啟動後自動開啟瀏覽器")
     args = parser.parse_args()
 
-    global DB_PATH
+    global DB_PATH, STARTED_AT
 
     if args.db:
         DB_PATH = args.db
@@ -607,12 +1248,20 @@ def main():
         print(f"   python3 {sys.argv[0]} --db /path/to/.ctx-save/context.db")
         sys.exit(1)
 
+    # 啟動前執行 schema migration（冪等）
+    _run_migration()
+
+    # 記錄啟動時間（ISO8601 UTC）
+    STARTED_AT = datetime.utcnow().isoformat() + "Z"
+
+    # 對外僅 127.0.0.1（只能本機連線，見 arch.md §10 安全邊界）
     url = f"http://localhost:{args.port}"
     print(f"")
     print(f"  ⚙ Context Save Viewer")
     print(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print(f"  📂 DB:   {DB_PATH}")
-    print(f"  🌐 URL:  {url}")
+    print(f"  📂 DB:      {DB_PATH}")
+    print(f"  🌐 URL:     {url}")
+    print(f"  🏷️  Version: {VERSION}")
     print(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print(f"  Ctrl+C 停止")
     print(f"")
@@ -620,7 +1269,10 @@ def main():
     if args.open:
         webbrowser.open(url)
 
-    server = HTTPServer(("0.0.0.0", args.port), RequestHandler)
+    # bind 127.0.0.1 — 僅限本機連線
+    # 使用 ThreadingHTTPServer 避免單一慢請求阻塞 /api/ping 等健康檢查
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), RequestHandler)
+    server.daemon_threads = True
     try:
         server.serve_forever()
     except KeyboardInterrupt:

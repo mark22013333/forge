@@ -3,6 +3,7 @@
 
 用法:
     ctx-db.py init                    初始化資料庫
+    ctx-db.py migrate                 執行資料庫遷移（冪等）
     ctx-db.py save                    儲存記錄（從 stdin 讀取 JSON）
     ctx-db.py list [limit]            列出快照（預設 20）
     ctx-db.py get <session_id>        取得特定 session 的所有記錄
@@ -27,6 +28,25 @@ DB_NAME = "context.db"
 def get_db_path(project_root=None):
     root = project_root or os.getcwd()
     return os.path.join(root, ".ctx-save", DB_NAME)
+
+
+def migrate_add_deleted_at(conn) -> bool:
+    """冪等遷移：偵測 deleted_at 欄位是否存在，不存在才加。
+
+    Returns:
+        True 表示實際執行了遷移，False 表示已是最新版。
+    """
+    cursor = conn.execute("PRAGMA table_info(context_saves)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "deleted_at" in columns:
+        return False
+    conn.execute("ALTER TABLE context_saves ADD COLUMN deleted_at DATETIME")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_saves_deleted "
+        "ON context_saves(deleted_at)"
+    )
+    conn.commit()
+    return True
 
 
 def init_db(db_path):
@@ -63,6 +83,8 @@ def init_db(db_path):
         ON context_saves(category)
     """)
     conn.commit()
+    # 確保既有資料庫也會被升級（冪等）
+    migrate_add_deleted_at(conn)
     conn.close()
     return db_path
 
@@ -108,10 +130,11 @@ def list_sessions(db_path, project_path=None, limit=20):
             COUNT(*) as item_count,
             GROUP_CONCAT(title, ' | ') as titles
         FROM context_saves
+        WHERE deleted_at IS NULL
     """
     params = []
     if project_path:
-        query += " WHERE project_path = ?"
+        query += " AND project_path = ?"
         params.append(project_path)
     query += " GROUP BY session_id ORDER BY created_at DESC LIMIT ?"
     params.append(limit)
@@ -141,7 +164,7 @@ def get_session(db_path, session_id):
     rows = conn.execute("""
         SELECT category, title, content, tags, context_percentage, created_at, model
         FROM context_saves
-        WHERE session_id = ?
+        WHERE session_id = ? AND deleted_at IS NULL
         ORDER BY id
     """, (session_id,)).fetchall()
     conn.close()
@@ -169,7 +192,8 @@ def search(db_path, keyword, project_path=None):
     query = """
         SELECT session_id, created_at, category, title, content
         FROM context_saves
-        WHERE (title LIKE ? OR content LIKE ? OR tags LIKE ?)
+        WHERE deleted_at IS NULL
+          AND (title LIKE ? OR content LIKE ? OR tags LIKE ?)
     """
     like = f"%{keyword}%"
     params = [like, like, like]
@@ -200,7 +224,11 @@ def clean(db_path, days=30):
         return
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
     conn = sqlite3.connect(db_path)
-    result = conn.execute("DELETE FROM context_saves WHERE created_at < ?", (cutoff,))
+    # 僅硬刪尚未軟刪除的記錄，避免重複處理已 soft delete 的資料
+    result = conn.execute(
+        "DELETE FROM context_saves WHERE created_at < ? AND deleted_at IS NULL",
+        (cutoff,),
+    )
     count = result.rowcount
     conn.commit()
     conn.close()
@@ -213,13 +241,23 @@ def stats(db_path):
         print(json.dumps({"message": "尚無保存記錄"}, ensure_ascii=False))
         return
     conn = sqlite3.connect(db_path)
-    total = conn.execute("SELECT COUNT(*) FROM context_saves").fetchone()[0]
-    sessions = conn.execute("SELECT COUNT(DISTINCT session_id) FROM context_saves").fetchone()[0]
+    total = conn.execute(
+        "SELECT COUNT(*) FROM context_saves WHERE deleted_at IS NULL"
+    ).fetchone()[0]
+    sessions = conn.execute(
+        "SELECT COUNT(DISTINCT session_id) FROM context_saves WHERE deleted_at IS NULL"
+    ).fetchone()[0]
     categories = conn.execute("""
-        SELECT category, COUNT(*) FROM context_saves GROUP BY category ORDER BY COUNT(*) DESC
+        SELECT category, COUNT(*) FROM context_saves
+        WHERE deleted_at IS NULL
+        GROUP BY category ORDER BY COUNT(*) DESC
     """).fetchall()
-    oldest = conn.execute("SELECT MIN(created_at) FROM context_saves").fetchone()[0]
-    newest = conn.execute("SELECT MAX(created_at) FROM context_saves").fetchone()[0]
+    oldest = conn.execute(
+        "SELECT MIN(created_at) FROM context_saves WHERE deleted_at IS NULL"
+    ).fetchone()[0]
+    newest = conn.execute(
+        "SELECT MAX(created_at) FROM context_saves WHERE deleted_at IS NULL"
+    ).fetchone()[0]
     conn.close()
 
     print(json.dumps({
@@ -243,6 +281,23 @@ if __name__ == "__main__":
     if cmd == "init":
         path = init_db(db_path)
         print(json.dumps({"status": "ok", "db_path": path}, ensure_ascii=False))
+
+    elif cmd == "migrate":
+        # 若 DB 檔不存在則先建立
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        if not os.path.exists(db_path):
+            init_db(db_path)
+            print("✅ 已升級：新增 deleted_at 欄位")
+        else:
+            conn = sqlite3.connect(db_path)
+            try:
+                migrated = migrate_add_deleted_at(conn)
+            finally:
+                conn.close()
+            if migrated:
+                print("✅ 已升級：新增 deleted_at 欄位")
+            else:
+                print("ℹ 已是最新版")
 
     elif cmd == "save":
         data = json.load(sys.stdin)

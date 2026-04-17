@@ -1,0 +1,12 @@
+# Local spec files (managed by plan-* skills)
+.spec/
+
+# ctx-save runtime database
+.ctx-save/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
