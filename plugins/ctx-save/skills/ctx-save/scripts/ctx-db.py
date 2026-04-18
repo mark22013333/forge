@@ -1,36 +1,157 @@
 #!/usr/bin/env python3
-"""ctx-db.py — Context Save SQLite 操作腳本
+"""ctx-db.py — Context Save SQLite 操作腳本（v2.1 集中式 DB）
 
 用法:
-    ctx-db.py init                    初始化資料庫
-    ctx-db.py migrate                 執行資料庫遷移（冪等）
-    ctx-db.py save                    儲存記錄（從 stdin 讀取 JSON）
-    ctx-db.py list [limit]            列出快照（預設 20）
-    ctx-db.py get <session_id>        取得特定 session 的所有記錄
-    ctx-db.py search <keyword>        搜尋關鍵字
-    ctx-db.py clean [days]            清除 N 天前的記錄（預設 30）
-    ctx-db.py stats                   統計資訊
+    ctx-db.py init                         初始化資料庫
+    ctx-db.py migrate                      執行資料庫遷移（冪等）
+    ctx-db.py migrate-legacy [--dry-run]   掃描並合併舊 per-project DB
+    ctx-db.py save                         儲存記錄（從 stdin 讀取 JSON）
+    ctx-db.py list [limit]                 列出快照（預設 20；最大 500）
+    ctx-db.py list-projects                列出所有專案（含筆數）
+    ctx-db.py get <session_id>             取得特定 session 的所有記錄
+    ctx-db.py search <keyword>             搜尋關鍵字（keyword 長度 ≤ 200）
+    ctx-db.py clean [days]                 清除 N 天前的記錄（預設 30）
+    ctx-db.py stats                        統計資訊（含 by_project）
 
 環境變數:
-    CTX_PROJECT  專案根目錄（預設為 cwd）
+    CTX_SAVE_DB_PATH     覆寫中央 DB 路徑（預設 ~/.ctx-save/context.db）
+    CTX_SAVE_NO_MIGRATE  設定則跳過 auto-migrate
+    CTX_PROJECT          寫入時的 project_path 覆寫（預設 Path.cwd()）
 """
 
 import json
+import os
+import re
 import sqlite3
 import sys
-import os
 from datetime import datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import Dict, List, Optional, Tuple, Union
+
+# ---------------------------------------------------------------------------
+# 常數
+# ---------------------------------------------------------------------------
 
 DB_NAME = "context.db"
+DEFAULT_CENTRAL_DIR = Path.home() / ".ctx-save"
+DEFAULT_DB_PATH = DEFAULT_CENTRAL_DIR / DB_NAME
+MIGRATION_FLAG = DEFAULT_CENTRAL_DIR / ".migration-done"
+
+# 白名單正則（新寫入才套用）
+CATEGORY_REGEX = re.compile(r"^[a-z0-9_-]{1,32}$")
+SESSION_ID_REGEX = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# 長度上限
+MAX_SEARCH_LEN = 200
+MAX_LIST_LIMIT = 500
+
+# ---------------------------------------------------------------------------
+# 路徑策略
+# ---------------------------------------------------------------------------
 
 
-def get_db_path(project_root=None):
-    root = project_root or os.getcwd()
-    return os.path.join(root, ".ctx-save", DB_NAME)
+def get_db_path() -> Path:
+    """取得中央 DB 路徑。
+
+    優先序：
+      1. 環境變數 CTX_SAVE_DB_PATH
+      2. ~/.ctx-save/context.db
+    """
+    override = os.environ.get("CTX_SAVE_DB_PATH")
+    if override:
+        return Path(override).expanduser().resolve()
+    return DEFAULT_DB_PATH
 
 
-def migrate_add_deleted_at(conn) -> bool:
+def _resolve_project_path() -> str:
+    """決定寫入時的 project_path（POSIX 字串）。
+
+    優先序：
+      1. 環境變數 CTX_PROJECT
+      2. Path.cwd().resolve()
+    """
+    value = os.environ.get("CTX_PROJECT")
+    if value:
+        path = Path(value).expanduser().resolve()
+    else:
+        path = Path.cwd().resolve()
+    # 統一轉 POSIX 字串（Windows 會變成 /C:/Users/... 但跨平台一致）
+    return str(PurePosixPath(path.as_posix()))
+
+
+# ---------------------------------------------------------------------------
+# 連線工廠
+# ---------------------------------------------------------------------------
+
+
+def _configure_connection(conn: sqlite3.Connection, writer: bool = False) -> None:
+    """對連線套用統一 PRAGMA。writer=True 時再 BEGIN IMMEDIATE。"""
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA foreign_keys = ON")
+    if writer:
+        # 立即取得 write lock，避免 reader → writer 升級時才發現衝突
+        conn.execute("BEGIN IMMEDIATE")
+
+
+def _connect_db(db_path: Path, writer: bool = False) -> sqlite3.Connection:
+    """建立連線並套 PRAGMA。
+
+    寫入端必 writer=True（自動 BEGIN IMMEDIATE）；
+    讀取端留空。回傳的 Connection 可用 `with ... as conn:` 自動 commit/close。
+    """
+    path_obj = Path(db_path)
+    path_obj.parent.mkdir(parents=True, exist_ok=True)
+    # isolation_level=None 讓 PRAGMA / BEGIN IMMEDIATE 不受 Python DB-API 自動交易干擾
+    conn = sqlite3.connect(str(path_obj), isolation_level=None)
+    _configure_connection(conn, writer=writer)
+    return conn
+
+
+# ---------------------------------------------------------------------------
+# Schema 初始化與 Migration
+# ---------------------------------------------------------------------------
+
+
+def _init_schema(conn: sqlite3.Connection) -> None:
+    """建立 schema 與索引（冪等）。
+
+    對新 DB：project_path 直接 NOT NULL DEFAULT '(unknown)'；
+    對舊 DB：由 migrate_add_project_path 漸進升級。
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS context_saves (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            project_path TEXT NOT NULL DEFAULT '(unknown)',
+            context_percentage REAL,
+            title TEXT NOT NULL,
+            category TEXT NOT NULL,
+            content TEXT NOT NULL,
+            tags TEXT DEFAULT '',
+            model TEXT DEFAULT '',
+            deleted_at DATETIME
+        )
+        """
+    )
+    # 索引（冪等）
+    index_defs = [
+        "CREATE INDEX IF NOT EXISTS idx_saves_session  ON context_saves(session_id)",
+        "CREATE INDEX IF NOT EXISTS idx_saves_project  ON context_saves(project_path)",
+        "CREATE INDEX IF NOT EXISTS idx_saves_created  ON context_saves(created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_saves_category ON context_saves(category)",
+        "CREATE INDEX IF NOT EXISTS idx_saves_deleted  ON context_saves(deleted_at)",
+        "CREATE INDEX IF NOT EXISTS idx_saves_project_created "
+        "ON context_saves(project_path, created_at DESC)",
+    ]
+    for sql in index_defs:
+        conn.execute(sql)
+
+
+def migrate_add_deleted_at(conn: sqlite3.Connection) -> bool:
     """冪等遷移：偵測 deleted_at 欄位是否存在，不存在才加。
 
     Returns:
@@ -45,102 +166,479 @@ def migrate_add_deleted_at(conn) -> bool:
         "CREATE INDEX IF NOT EXISTS idx_saves_deleted "
         "ON context_saves(deleted_at)"
     )
-    conn.commit()
     return True
 
 
-def init_db(db_path):
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS context_saves (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            project_path TEXT NOT NULL,
-            context_percentage REAL,
-            title TEXT NOT NULL,
-            category TEXT NOT NULL,
-            content TEXT NOT NULL,
-            tags TEXT DEFAULT '',
-            model TEXT DEFAULT ''
-        )
-    """)
-    conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_saves_session
-        ON context_saves(session_id)
-    """)
-    conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_saves_project
-        ON context_saves(project_path)
-    """)
-    conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_saves_created
-        ON context_saves(created_at DESC)
-    """)
-    conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_saves_category
-        ON context_saves(category)
-    """)
-    conn.commit()
-    # 確保既有資料庫也會被升級（冪等）
-    migrate_add_deleted_at(conn)
-    conn.close()
-    return db_path
+def migrate_add_project_path(conn: sqlite3.Connection) -> bool:
+    """冪等遷移：為舊 DB 補上 project_path 欄位並回填 '(unknown)'。
 
+    SQLite 不支援 NOT NULL 無預設的 ALTER ADD，因此先加 nullable 再回填。
+    新 DB 由 _init_schema 直接 NOT NULL DEFAULT，不會走到這裡。
 
-def save(db_path, records):
-    """儲存多筆 context 記錄"""
-    init_db(db_path)
-    conn = sqlite3.connect(db_path)
-    inserted = 0
-    for r in records:
-        conn.execute("""
-            INSERT INTO context_saves
-                (session_id, project_path, context_percentage, title, category, content, tags, model)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            r.get("session_id", ""),
-            r.get("project_path", ""),
-            r.get("context_percentage", 0),
-            r.get("title", ""),
-            r.get("category", ""),
-            r.get("content", ""),
-            r.get("tags", ""),
-            r.get("model", ""),
-        ))
-        inserted += 1
-    conn.commit()
-    conn.close()
-    print(json.dumps({"status": "ok", "inserted": inserted}, ensure_ascii=False))
-
-
-def list_sessions(db_path, project_path=None, limit=20):
-    """列出已保存的 session 快照"""
-    if not os.path.exists(db_path):
-        print(json.dumps({"sessions": [], "message": "尚無保存記錄"}, ensure_ascii=False))
-        return
-    conn = sqlite3.connect(db_path)
-    query = """
-        SELECT
-            session_id,
-            MIN(created_at) as created_at,
-            GROUP_CONCAT(DISTINCT category) as categories,
-            MAX(context_percentage) as context_pct,
-            COUNT(*) as item_count,
-            GROUP_CONCAT(title, ' | ') as titles
-        FROM context_saves
-        WHERE deleted_at IS NULL
+    Returns:
+        True 表示實際加過欄位，False 表示已存在。
     """
-    params = []
-    if project_path:
-        query += " AND project_path = ?"
-        params.append(project_path)
-    query += " GROUP BY session_id ORDER BY created_at DESC LIMIT ?"
-    params.append(limit)
+    cursor = conn.execute("PRAGMA table_info(context_saves)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "project_path" in columns:
+        return False
+    conn.execute("ALTER TABLE context_saves ADD COLUMN project_path TEXT")
+    conn.execute(
+        "UPDATE context_saves SET project_path = '(unknown)' "
+        "WHERE project_path IS NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_saves_project "
+        "ON context_saves(project_path)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_saves_project_created "
+        "ON context_saves(project_path, created_at DESC)"
+    )
+    return True
 
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
+
+def _run_all_migrations(conn: sqlite3.Connection) -> Dict[str, bool]:
+    """依序跑所有 migration，回報每一步是否實際執行。"""
+    return {
+        "deleted_at": migrate_add_deleted_at(conn),
+        "project_path": migrate_add_project_path(conn),
+    }
+
+
+def init_db(db_path: Optional[Union[str, Path]] = None) -> str:
+    """初始化資料庫（冪等）。
+
+    無參數時用 get_db_path()；為利 importlib 呼叫保留可傳入參數。
+    """
+    target = Path(db_path) if db_path else get_db_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with _connect_db(target, writer=True) as conn:
+        _init_schema(conn)
+        _run_all_migrations(conn)
+        conn.execute("COMMIT")
+    return str(target)
+
+
+# ---------------------------------------------------------------------------
+# 驗證與白名單
+# ---------------------------------------------------------------------------
+
+
+def _sanitize_category(value: str) -> Tuple[str, Optional[str]]:
+    """檢查 category 是否符合白名單。
+
+    Returns:
+        (cleaned, original_if_rejected)
+        合法 → (原值, None)
+        非法 → ("custom", 原值)   — 原值由 caller 決定是否附加到 content
+    """
+    if isinstance(value, str) and CATEGORY_REGEX.match(value):
+        return value, None
+    return "custom", value if value else None
+
+
+def _validate_session_id(value: str) -> bool:
+    """驗證 session_id 格式。"""
+    return isinstance(value, str) and bool(SESSION_ID_REGEX.match(value))
+
+
+# ---------------------------------------------------------------------------
+# Legacy 合併
+# ---------------------------------------------------------------------------
+
+
+def _legacy_fallback_project_path(legacy_db: Path) -> str:
+    """legacy DB 缺 project_path 時的回填值。
+
+    legacy 路徑形如 `{project}/.ctx-save/context.db`，
+    回傳 `{project}` 的 POSIX 字串。
+    """
+    # context.db → .ctx-save → {project}
+    project_dir = legacy_db.parent.parent
+    return str(PurePosixPath(project_dir.resolve().as_posix()))
+
+
+def _legacy_scan_roots() -> List[Path]:
+    """決定 legacy DB 掃描根目錄清單。
+
+    優先序：
+        1. CTX_SAVE_MIGRATE_ROOTS 環境變數（冒號分隔的絕對路徑）
+        2. 預設候選：~/IdeaProjects、~/Projects、~/workspace、~/code、~/src
+           — 只保留實際存在的目錄
+
+    刻意**不**掃整個 ~，避免 Library / Caches / node_modules 等巨量無關檔案。
+    """
+    raw = os.environ.get("CTX_SAVE_MIGRATE_ROOTS", "").strip()
+    if raw:
+        roots = [Path(p).expanduser() for p in raw.split(":") if p.strip()]
+        return [r for r in roots if r.is_dir()]
+    home = Path.home()
+    candidates = [
+        home / "IdeaProjects",
+        home / "Projects",
+        home / "workspace",
+        home / "code",
+        home / "src",
+    ]
+    return [c for c in candidates if c.is_dir()]
+
+
+def _scan_legacy_dbs(central_db: Path) -> List[Path]:
+    """掃描 workspace 根目錄下的 legacy DB，排除中央 DB 自身與 DEFAULT_CENTRAL_DIR。"""
+    central_resolved = central_db.resolve()
+    central_dir_resolved = DEFAULT_CENTRAL_DIR.resolve()
+    found: List[Path] = []
+    for root in _legacy_scan_roots():
+        try:
+            for candidate in root.rglob(".ctx-save/context.db"):
+                try:
+                    resolved = candidate.resolve()
+                except OSError:
+                    continue
+                # 排除中央 DB 本身
+                if resolved == central_resolved:
+                    continue
+                # 排除 ~/.ctx-save/ 目錄底下的任何 context.db
+                try:
+                    resolved.relative_to(central_dir_resolved)
+                    continue
+                except ValueError:
+                    pass
+                found.append(resolved)
+        except (PermissionError, OSError):
+            # rglob 在無權限目錄上會噴錯，忽略該 root
+            continue
+    return found
+
+
+def _legacy_has_column(conn: sqlite3.Connection, alias: str, column: str) -> bool:
+    """檢查 attached DB 的 context_saves 是否有特定欄位。"""
+    cursor = conn.execute(
+        "SELECT name FROM " + alias + ".sqlite_master "
+        "WHERE type='table' AND name='context_saves'"
+    )
+    if cursor.fetchone() is None:
+        return False
+    cursor = conn.execute("PRAGMA " + alias + ".table_info(context_saves)")
+    cols = {row[1] for row in cursor.fetchall()}
+    return column in cols
+
+
+def migrate_legacy(central_db: Path, dry_run: bool = False) -> Dict:
+    """掃描 ~ 下所有 legacy per-project DB，合併進中央 DB。
+
+    Args:
+        central_db: 中央 DB 路徑
+        dry_run: True 則只列出不執行
+
+    Returns:
+        {
+            "ok": bool,
+            "migrated_files": int,     # 成功合併的 legacy DB 數
+            "total_inserted": int,     # 新增進中央 DB 的列數
+            "skipped_duplicate": int,  # 因去重而跳過的列數（估算）
+            "legacy_dbs": [str],       # 本次掃描到的 legacy DB 絕對路徑
+            "renamed": [str],          # 改名為 .migrated-YYYYMMDD 的新檔名
+            "errors": [{"path":..., "error":...}],
+        }
+    """
+    central_db = Path(central_db)
+    legacy_dbs = _scan_legacy_dbs(central_db)
+
+    result = {
+        "ok": True,
+        "migrated_files": 0,
+        "total_inserted": 0,
+        "skipped_duplicate": 0,
+        "legacy_dbs": [str(p) for p in legacy_dbs],
+        "renamed": [],
+        "errors": [],
+        "dry_run": dry_run,
+    }
+
+    if not legacy_dbs:
+        return result
+
+    # 確保中央 DB 已初始化
+    if not dry_run:
+        init_db(central_db)
+
+    stamp = datetime.now().strftime("%Y%m%d")
+
+    if dry_run:
+        # dry-run 只掃描並回報預估筆數
+        for legacy_db in legacy_dbs:
+            try:
+                legacy_conn = sqlite3.connect(str(legacy_db))
+                try:
+                    row = legacy_conn.execute(
+                        "SELECT COUNT(*) FROM context_saves"
+                    ).fetchone()
+                    if row:
+                        result["total_inserted"] += int(row[0])
+                finally:
+                    legacy_conn.close()
+            except sqlite3.Error as exc:
+                result["errors"].append({"path": str(legacy_db), "error": str(exc)})
+        return result
+
+    # 實際合併：逐檔 ATTACH；rename 延後到 COMMIT 之後
+    # （SQLite 在 transaction 期間對 attached 檔保有 lock，需釋放後才能 rename）
+    to_rename: List[Path] = []
+    with _connect_db(central_db, writer=True) as conn:
+        for legacy_db in legacy_dbs:
+            attached = False
+            try:
+                fallback = _legacy_fallback_project_path(legacy_db)
+                # SQLite 不支援 ? 綁定在 ATTACH 檔名；escape 單引號避免注入
+                legacy_path_escaped = str(legacy_db).replace("'", "''")
+                conn.execute("ATTACH DATABASE '" + legacy_path_escaped + "' AS legacy")
+                attached = True
+
+                # 檢查 legacy 是否有 context_saves 表
+                cursor = conn.execute(
+                    "SELECT name FROM legacy.sqlite_master "
+                    "WHERE type='table' AND name='context_saves'"
+                )
+                if cursor.fetchone() is None:
+                    result["errors"].append({
+                        "path": str(legacy_db),
+                        "error": "no context_saves table",
+                    })
+                    continue
+
+                # 判斷 legacy 是否含 project_path / deleted_at 欄位
+                has_project = _legacy_has_column(conn, "legacy", "project_path")
+                has_deleted = _legacy_has_column(conn, "legacy", "deleted_at")
+
+                project_expr = (
+                    "COALESCE(l.project_path, ?)" if has_project else "?"
+                )
+                deleted_expr = "l.deleted_at" if has_deleted else "NULL"
+
+                # 合併前 / 後總筆數，推算插入與跳過
+                before_total = conn.execute(
+                    "SELECT COUNT(*) FROM main.context_saves"
+                ).fetchone()[0]
+                legacy_total = conn.execute(
+                    "SELECT COUNT(*) FROM legacy.context_saves"
+                ).fetchone()[0]
+
+                insert_sql = (
+                    "INSERT INTO main.context_saves ("
+                    "    session_id, created_at, project_path,"
+                    "    context_percentage, title, category, content,"
+                    "    tags, model, deleted_at"
+                    ") SELECT "
+                    "    l.session_id, l.created_at, " + project_expr + ","
+                    "    l.context_percentage, l.title, l.category, l.content,"
+                    "    COALESCE(l.tags, ''), COALESCE(l.model, ''), " + deleted_expr + " "
+                    "FROM legacy.context_saves AS l "
+                    "WHERE NOT EXISTS ("
+                    "    SELECT 1 FROM main.context_saves AS m "
+                    "    WHERE m.session_id = l.session_id "
+                    "      AND m.created_at = l.created_at "
+                    "      AND m.title = l.title"
+                    ")"
+                )
+                conn.execute(insert_sql, (fallback,))
+
+                after_total = conn.execute(
+                    "SELECT COUNT(*) FROM main.context_saves"
+                ).fetchone()[0]
+
+                inserted = after_total - before_total
+                skipped = legacy_total - inserted
+                if skipped < 0:
+                    skipped = 0
+                result["total_inserted"] += inserted
+                result["skipped_duplicate"] += skipped
+                result["migrated_files"] += 1
+                to_rename.append(legacy_db)
+
+            except sqlite3.Error as exc:
+                result["errors"].append({"path": str(legacy_db), "error": str(exc)})
+            finally:
+                if attached:
+                    try:
+                        conn.execute("DETACH DATABASE legacy")
+                    except sqlite3.Error:
+                        pass
+
+        conn.execute("COMMIT")
+
+    # COMMIT 之後 SQLite 已釋放對 legacy 檔的 lock，此時才能安全改名
+    for legacy_db in to_rename:
+        try:
+            renamed_path = legacy_db.with_name("context.db.migrated-" + stamp)
+            if renamed_path.exists():
+                suffix = 1
+                while True:
+                    alt = legacy_db.with_name(
+                        "context.db.migrated-" + stamp + "-" + str(suffix)
+                    )
+                    if not alt.exists():
+                        renamed_path = alt
+                        break
+                    suffix += 1
+            legacy_db.rename(renamed_path)
+            result["renamed"].append(str(renamed_path))
+        except OSError as exc:
+            result["errors"].append({"path": str(legacy_db), "error": str(exc)})
+
+    return result
+
+
+def maybe_auto_migrate() -> Optional[Dict]:
+    """首次觸發時自動升級 schema + 合併 legacy DB。
+
+    跳過條件：
+      - 環境變數 CTX_SAVE_NO_MIGRATE 有設定
+      - ~/.ctx-save/.migration-done 旗標已存在
+
+    合併完成後（即使沒有 legacy）寫入旗標；只有錯誤時才不寫。
+
+    Note:
+        此函式也負責「既有中央 DB 的 schema migration」——若使用者從 v1 升級而來，
+        中央 DB 可能缺 `deleted_at` / `project_path` 欄位，必須先 migrate schema
+        才能讓 list/search 等查詢正常運作。
+    """
+    if os.environ.get("CTX_SAVE_NO_MIGRATE"):
+        return None
+    if MIGRATION_FLAG.exists():
+        return None
+    DEFAULT_CENTRAL_DIR.mkdir(parents=True, exist_ok=True)
+    central_db = get_db_path()
+    # 先跑 schema migration（冪等），確保中央 DB 欄位齊全
+    if central_db.exists():
+        try:
+            with _connect_db(central_db, writer=True) as conn:
+                _run_all_migrations(conn)
+                conn.execute("COMMIT")
+        except sqlite3.Error as exc:
+            return {"ok": False, "errors": [{"phase": "schema_migration", "error": str(exc)}]}
+    report = migrate_legacy(central_db, dry_run=False)
+    if report.get("ok") and not report.get("errors"):
+        try:
+            MIGRATION_FLAG.touch()
+        except OSError:
+            pass
+    return report
+
+
+# ---------------------------------------------------------------------------
+# CRUD：save / list / get / search / clean / stats / list_projects
+# ---------------------------------------------------------------------------
+
+
+def save(db_path: Path, records: List[Dict]) -> None:
+    """儲存多筆 context 記錄。
+
+    自動：
+      - init_db（冪等）
+      - 套用 category 白名單（非法改 custom，並把原值附加到 content 前綴）
+      - 強制填 project_path（若 record 未帶 → _resolve_project_path()）
+      - session_id 格式驗證（拋 ValueError）
+    """
+    db_path = Path(db_path)
+    init_db(db_path)
+    default_project = _resolve_project_path()
+
+    with _connect_db(db_path, writer=True) as conn:
+        inserted = 0
+        for r in records:
+            session_id = r.get("session_id", "")
+            if not _validate_session_id(session_id):
+                conn.execute("ROLLBACK")
+                raise ValueError(
+                    "invalid session_id: must match ^[A-Za-z0-9_-]{1,64}$"
+                )
+
+            # category 白名單
+            raw_category = r.get("category", "") or ""
+            cleaned_category, original = _sanitize_category(raw_category)
+            content = r.get("content", "") or ""
+            if original is not None and original:
+                content = "[原 category: " + str(original) + "]\n" + content
+
+            # project_path
+            project_path = r.get("project_path") or default_project
+
+            conn.execute(
+                """
+                INSERT INTO context_saves
+                    (session_id, project_path, context_percentage,
+                     title, category, content, tags, model)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    project_path,
+                    r.get("context_percentage", 0),
+                    r.get("title", ""),
+                    cleaned_category,
+                    content,
+                    r.get("tags", ""),
+                    r.get("model", ""),
+                ),
+            )
+            inserted += 1
+        conn.execute("COMMIT")
+
+    print(json.dumps(
+        {"status": "ok", "inserted": inserted, "db_path": str(db_path)},
+        ensure_ascii=False,
+    ))
+
+
+def list_sessions(
+    db_path: Path,
+    project_path: Optional[str] = None,
+    limit: int = 20,
+) -> None:
+    """列出已保存的 session 快照。limit 超過 500 會被限為 500。"""
+    db_path = Path(db_path)
+    if not db_path.exists():
+        print(json.dumps(
+            {"sessions": [], "message": "尚無保存記錄"},
+            ensure_ascii=False,
+        ))
+        return
+
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 20
+    if limit > MAX_LIST_LIMIT:
+        limit = MAX_LIST_LIMIT
+    if limit <= 0:
+        limit = 20
+
+    with _connect_db(db_path) as conn:
+        query = """
+            SELECT
+                session_id,
+                MIN(created_at) as created_at,
+                GROUP_CONCAT(DISTINCT category) as categories,
+                MAX(context_percentage) as context_pct,
+                COUNT(*) as item_count,
+                GROUP_CONCAT(title, ' | ') as titles,
+                project_path
+            FROM context_saves
+            WHERE deleted_at IS NULL
+        """
+        params: List = []
+        if project_path:
+            query += " AND project_path = ?"
+            params.append(project_path)
+        query += (
+            " GROUP BY session_id, project_path "
+            "ORDER BY MIN(created_at) DESC LIMIT ?"
+        )
+        params.append(limit)
+
+        rows = conn.execute(query, params).fetchall()
 
     sessions = []
     for r in rows:
@@ -151,23 +649,37 @@ def list_sessions(db_path, project_path=None, limit=20):
             "context_percentage": r[3],
             "item_count": r[4],
             "titles": r[5],
+            "project_path": r[6],
         })
     print(json.dumps({"sessions": sessions}, ensure_ascii=False, indent=2))
 
 
-def get_session(db_path, session_id):
-    """取得特定 session 的所有記錄"""
-    if not os.path.exists(db_path):
-        print(json.dumps({"records": [], "message": "尚無保存記錄"}, ensure_ascii=False))
+def get_session(db_path: Path, session_id: str) -> None:
+    """取得特定 session 的所有記錄。"""
+    if not _validate_session_id(session_id):
+        raise ValueError(
+            "invalid session_id: must match ^[A-Za-z0-9_-]{1,64}$"
+        )
+
+    db_path = Path(db_path)
+    if not db_path.exists():
+        print(json.dumps(
+            {"records": [], "message": "尚無保存記錄"},
+            ensure_ascii=False,
+        ))
         return
-    conn = sqlite3.connect(db_path)
-    rows = conn.execute("""
-        SELECT category, title, content, tags, context_percentage, created_at, model
-        FROM context_saves
-        WHERE session_id = ? AND deleted_at IS NULL
-        ORDER BY id
-    """, (session_id,)).fetchall()
-    conn.close()
+
+    with _connect_db(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT category, title, content, tags,
+                   context_percentage, created_at, model, project_path
+            FROM context_saves
+            WHERE session_id = ? AND deleted_at IS NULL
+            ORDER BY id
+            """,
+            (session_id,),
+        ).fetchall()
 
     records = []
     for r in rows:
@@ -179,31 +691,45 @@ def get_session(db_path, session_id):
             "context_percentage": r[4],
             "created_at": r[5],
             "model": r[6],
+            "project_path": r[7],
         })
     print(json.dumps({"records": records}, ensure_ascii=False, indent=2))
 
 
-def search(db_path, keyword, project_path=None):
-    """搜尋記錄"""
-    if not os.path.exists(db_path):
-        print(json.dumps({"results": [], "message": "尚無保存記錄"}, ensure_ascii=False))
-        return
-    conn = sqlite3.connect(db_path)
-    query = """
-        SELECT session_id, created_at, category, title, content
-        FROM context_saves
-        WHERE deleted_at IS NULL
-          AND (title LIKE ? OR content LIKE ? OR tags LIKE ?)
-    """
-    like = f"%{keyword}%"
-    params = [like, like, like]
-    if project_path:
-        query += " AND project_path = ?"
-        params.append(project_path)
-    query += " ORDER BY created_at DESC LIMIT 20"
+def search(
+    db_path: Path,
+    keyword: str,
+    project_path: Optional[str] = None,
+) -> None:
+    """搜尋記錄。keyword 長度超過 200 字元會拋 ValueError。"""
+    if not isinstance(keyword, str) or not keyword:
+        raise ValueError("keyword required")
+    if len(keyword) > MAX_SEARCH_LEN:
+        raise ValueError("keyword too long (max " + str(MAX_SEARCH_LEN) + ")")
 
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
+    db_path = Path(db_path)
+    if not db_path.exists():
+        print(json.dumps(
+            {"results": [], "message": "尚無保存記錄"},
+            ensure_ascii=False,
+        ))
+        return
+
+    with _connect_db(db_path) as conn:
+        query = """
+            SELECT session_id, created_at, category, title, content, project_path
+            FROM context_saves
+            WHERE deleted_at IS NULL
+              AND (title LIKE ? OR content LIKE ? OR tags LIKE ?)
+        """
+        like = "%" + keyword + "%"
+        params: List = [like, like, like]
+        if project_path:
+            query += " AND project_path = ?"
+            params.append(project_path)
+        query += " ORDER BY created_at DESC LIMIT 50"
+
+        rows = conn.execute(query, params).fetchall()
 
     results = []
     for r in rows:
@@ -213,120 +739,244 @@ def search(db_path, keyword, project_path=None):
             "category": r[2],
             "title": r[3],
             "content": r[4],
+            "project_path": r[5],
         })
     print(json.dumps({"results": results}, ensure_ascii=False, indent=2))
 
 
-def clean(db_path, days=30):
-    """清除 N 天前的記錄"""
-    if not os.path.exists(db_path):
-        print(json.dumps({"deleted": 0, "message": "尚無保存記錄"}, ensure_ascii=False))
+def clean(db_path: Path, days: int = 30) -> None:
+    """清除 N 天前的記錄（硬刪；僅刪除尚未軟刪除的資料）。"""
+    db_path = Path(db_path)
+    if not db_path.exists():
+        print(json.dumps(
+            {"deleted": 0, "message": "尚無保存記錄"},
+            ensure_ascii=False,
+        ))
         return
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-    conn = sqlite3.connect(db_path)
-    # 僅硬刪尚未軟刪除的記錄，避免重複處理已 soft delete 的資料
-    result = conn.execute(
-        "DELETE FROM context_saves WHERE created_at < ? AND deleted_at IS NULL",
-        (cutoff,),
-    )
-    count = result.rowcount
-    conn.commit()
-    conn.close()
+    with _connect_db(db_path, writer=True) as conn:
+        cur = conn.execute(
+            "DELETE FROM context_saves "
+            "WHERE created_at < ? AND deleted_at IS NULL",
+            (cutoff,),
+        )
+        count = cur.rowcount
+        conn.execute("COMMIT")
     print(json.dumps({"deleted": count, "days": days}, ensure_ascii=False))
 
 
-def stats(db_path):
-    """統計資訊"""
-    if not os.path.exists(db_path):
+def list_projects(db_path: Path) -> List[Dict]:
+    """列出所有專案（含筆數、session 數、最後寫入時間）。"""
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return []
+    with _connect_db(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT project_path,
+                   COUNT(*) as record_count,
+                   COUNT(DISTINCT session_id) as session_count,
+                   MAX(created_at) as last_saved
+            FROM context_saves
+            WHERE deleted_at IS NULL
+            GROUP BY project_path
+            ORDER BY last_saved DESC
+            """
+        ).fetchall()
+
+    projects = []
+    for r in rows:
+        project_path = r[0] or "(unknown)"
+        # name = basename
+        try:
+            name = PurePosixPath(project_path).name or project_path
+        except (TypeError, ValueError):
+            name = project_path
+        projects.append({
+            "path": project_path,
+            "name": name,
+            "record_count": r[1],
+            "session_count": r[2],
+            "last_saved": r[3],
+        })
+    return projects
+
+
+def stats(db_path: Path) -> None:
+    """統計資訊（含 by_project）。"""
+    db_path = Path(db_path)
+    if not db_path.exists():
         print(json.dumps({"message": "尚無保存記錄"}, ensure_ascii=False))
         return
-    conn = sqlite3.connect(db_path)
-    total = conn.execute(
-        "SELECT COUNT(*) FROM context_saves WHERE deleted_at IS NULL"
-    ).fetchone()[0]
-    sessions = conn.execute(
-        "SELECT COUNT(DISTINCT session_id) FROM context_saves WHERE deleted_at IS NULL"
-    ).fetchone()[0]
-    categories = conn.execute("""
-        SELECT category, COUNT(*) FROM context_saves
-        WHERE deleted_at IS NULL
-        GROUP BY category ORDER BY COUNT(*) DESC
-    """).fetchall()
-    oldest = conn.execute(
-        "SELECT MIN(created_at) FROM context_saves WHERE deleted_at IS NULL"
-    ).fetchone()[0]
-    newest = conn.execute(
-        "SELECT MAX(created_at) FROM context_saves WHERE deleted_at IS NULL"
-    ).fetchone()[0]
-    conn.close()
+    with _connect_db(db_path) as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM context_saves WHERE deleted_at IS NULL"
+        ).fetchone()[0]
+        sessions = conn.execute(
+            "SELECT COUNT(DISTINCT session_id) FROM context_saves "
+            "WHERE deleted_at IS NULL"
+        ).fetchone()[0]
+        categories = conn.execute(
+            """
+            SELECT category, COUNT(*) FROM context_saves
+            WHERE deleted_at IS NULL
+            GROUP BY category ORDER BY COUNT(*) DESC
+            """
+        ).fetchall()
+        by_project = conn.execute(
+            """
+            SELECT project_path, COUNT(*) FROM context_saves
+            WHERE deleted_at IS NULL
+            GROUP BY project_path ORDER BY COUNT(*) DESC
+            """
+        ).fetchall()
+        oldest = conn.execute(
+            "SELECT MIN(created_at) FROM context_saves WHERE deleted_at IS NULL"
+        ).fetchone()[0]
+        newest = conn.execute(
+            "SELECT MAX(created_at) FROM context_saves WHERE deleted_at IS NULL"
+        ).fetchone()[0]
 
-    print(json.dumps({
-        "total_records": total,
-        "total_sessions": sessions,
-        "categories": {c[0]: c[1] for c in categories},
-        "oldest": oldest,
-        "newest": newest,
-    }, ensure_ascii=False, indent=2))
+    print(json.dumps(
+        {
+            "total_records": total,
+            "total_sessions": sessions,
+            "categories": {c[0]: c[1] for c in categories},
+            "by_project": {p[0]: p[1] for p in by_project},
+            "oldest": oldest,
+            "newest": newest,
+        },
+        ensure_ascii=False,
+        indent=2,
+    ))
 
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
+# ---------------------------------------------------------------------------
+# CLI entries
+# ---------------------------------------------------------------------------
+
+
+def _cli_migrate_legacy(argv: List[str]) -> int:
+    """`migrate-legacy [--dry-run] [--yes]` 子指令 entry。"""
+    dry_run = "--dry-run" in argv
+    central_db = get_db_path()
+    report = migrate_legacy(central_db, dry_run=dry_run)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    # 成功（即使沒有 legacy）也寫 flag，避免下次再掃
+    if not dry_run and report.get("ok") and not report.get("errors"):
+        try:
+            DEFAULT_CENTRAL_DIR.mkdir(parents=True, exist_ok=True)
+            MIGRATION_FLAG.touch()
+        except OSError:
+            pass
+    return 0 if report.get("ok") else 1
+
+
+def _main(argv: List[str]) -> int:
+    if len(argv) < 2:
         print(__doc__)
-        sys.exit(1)
+        return 1
 
-    cmd = sys.argv[1]
-    project = os.environ.get("CTX_PROJECT", os.getcwd())
-    db_path = get_db_path(project)
+    cmd = argv[1]
+    db_path = get_db_path()
+
+    # 讀類指令先嘗試 auto-migrate
+    read_cmds = {"list", "list-projects", "get", "search", "stats"}
+    if cmd in read_cmds:
+        maybe_auto_migrate()
 
     if cmd == "init":
         path = init_db(db_path)
-        print(json.dumps({"status": "ok", "db_path": path}, ensure_ascii=False))
+        print(json.dumps(
+            {"status": "ok", "db_path": path},
+            ensure_ascii=False,
+        ))
+        return 0
 
-    elif cmd == "migrate":
-        # 若 DB 檔不存在則先建立
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        if not os.path.exists(db_path):
+    if cmd == "migrate":
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        if not db_path.exists():
             init_db(db_path)
-            print("✅ 已升級：新增 deleted_at 欄位")
+            print("✅ 已建立中央 DB 並套用最新 schema")
         else:
-            conn = sqlite3.connect(db_path)
-            try:
-                migrated = migrate_add_deleted_at(conn)
-            finally:
-                conn.close()
-            if migrated:
-                print("✅ 已升級：新增 deleted_at 欄位")
+            with _connect_db(db_path, writer=True) as conn:
+                _init_schema(conn)
+                migrated = _run_all_migrations(conn)
+                conn.execute("COMMIT")
+            if any(migrated.values()):
+                changed = [k for k, v in migrated.items() if v]
+                print("✅ 已升級：" + ", ".join(changed))
             else:
                 print("ℹ 已是最新版")
+        return 0
 
-    elif cmd == "save":
+    if cmd == "migrate-legacy":
+        return _cli_migrate_legacy(argv)
+
+    if cmd == "save":
         data = json.load(sys.stdin)
         records = data if isinstance(data, list) else [data]
-        save(db_path, records)
+        try:
+            save(db_path, records)
+        except ValueError as exc:
+            print(json.dumps(
+                {"status": "error", "error": str(exc)},
+                ensure_ascii=False,
+            ), file=sys.stderr)
+            return 2
+        return 0
 
-    elif cmd == "list":
-        limit = int(sys.argv[2]) if len(sys.argv) > 2 else 20
-        list_sessions(db_path, project_path=project, limit=limit)
+    if cmd == "list":
+        limit = int(argv[2]) if len(argv) > 2 else 20
+        # 無特定 project 篩選，列全部（集中式 DB 的慣用行為）
+        list_sessions(db_path, project_path=None, limit=limit)
+        return 0
 
-    elif cmd == "get":
-        if len(sys.argv) < 3:
+    if cmd == "list-projects":
+        projects = list_projects(db_path)
+        print(json.dumps({"projects": projects}, ensure_ascii=False, indent=2))
+        return 0
+
+    if cmd == "get":
+        if len(argv) < 3:
             print("用法: ctx-db.py get <session_id>", file=sys.stderr)
-            sys.exit(1)
-        get_session(db_path, sys.argv[2])
+            return 1
+        try:
+            get_session(db_path, argv[2])
+        except ValueError as exc:
+            print(json.dumps(
+                {"status": "error", "error": str(exc)},
+                ensure_ascii=False,
+            ), file=sys.stderr)
+            return 2
+        return 0
 
-    elif cmd == "search":
-        if len(sys.argv) < 3:
+    if cmd == "search":
+        if len(argv) < 3:
             print("用法: ctx-db.py search <keyword>", file=sys.stderr)
-            sys.exit(1)
-        search(db_path, sys.argv[2], project_path=project)
+            return 1
+        try:
+            search(db_path, argv[2], project_path=None)
+        except ValueError as exc:
+            print(json.dumps(
+                {"status": "error", "error": str(exc)},
+                ensure_ascii=False,
+            ), file=sys.stderr)
+            return 2
+        return 0
 
-    elif cmd == "clean":
-        days = int(sys.argv[2]) if len(sys.argv) > 2 else 30
+    if cmd == "clean":
+        days = int(argv[2]) if len(argv) > 2 else 30
         clean(db_path, days)
+        return 0
 
-    elif cmd == "stats":
+    if cmd == "stats":
         stats(db_path)
+        return 0
 
-    else:
-        print(f"未知指令: {cmd}", file=sys.stderr)
-        sys.exit(1)
+    print("未知指令: " + cmd, file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv))
