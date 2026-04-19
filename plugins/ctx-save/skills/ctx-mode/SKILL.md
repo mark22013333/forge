@@ -37,6 +37,21 @@ python3 "$HOME/.claude-company/plugins/marketplaces/forge/plugins/ctx-save/scrip
 - **`assist`**：日常使用。context 到閾值時提醒你手動 `/ctx-save`。
 - **`auto`**：手機/遠端控制，沒人能及時手動存。超閾值自動 raw dump 到 SQLite。
 
+## 重要觀念（使用者常問）
+
+**「會不會自動 dump？」** — 只有 `auto` 模式才會主動 dump。`off` / `assist` 都不會。但 Claude Code 壓縮對話前仍會觸發 **PreCompact 保底 dump**（不受 mode 影響）。
+
+**「冷卻時間是什麼？」** — 兩次提醒/主動 dump 的節流間隔（預設 15 分鐘），避免連續洗頻。PreCompact 保底 dump 與手動 `/ctx-save` 不受冷卻限制。
+
+## 欄位速查
+
+| 欄位 | 預設 | 說明 |
+|------|------|------|
+| `alert_threshold` | 60 | 達此 % 觸發提醒 |
+| `auto_dump_threshold` | 70 | `auto` 模式下達此 % 觸發主動 dump（CC 約 75% 自動 compact，務必 < 75） |
+| `cooldown_minutes` | 15 | 提醒/主動 dump 節流間隔（分鐘，>=0） |
+| `transcript_tail_kb` | 200 | dump 時讀 transcript 尾端多少 KB |
+
 ## 範例互動
 
 ```

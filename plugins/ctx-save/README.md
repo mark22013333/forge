@@ -153,6 +153,17 @@ python3 .../ctx-db.py migrate
 
 **何時選 auto？** 當你透過手機或遠端控制 Claude Code，context 快滿但沒人能即時手動 `/ctx-save` 的情境 — 讓 auto mode 替你保底。
 
+#### 主動 dump vs 保底 dump（重要）
+
+兩種 dump 是獨立機制，不要混淆：
+
+| 類型 | 觸發時機 | 受 mode 影響 | 受冷卻限制 |
+|------|---------|------------|----------|
+| **主動 dump**（`auto` 模式下的 PostToolUse） | 每次工具呼叫後檢查，超過 `auto_dump_threshold` 觸發 | ✅ 只有 `auto` 模式才會 | ✅ 是 |
+| **保底 dump**（PreCompact hook） | CC 準備自動壓縮對話前 | ❌ 不受 mode 影響，即使 `off` 也會 | ❌ 否 |
+
+換句話說：`assist` / `off` 模式**不會主動 dump**，但 CC 自動壓縮前仍會觸發保底 dump（把 transcript 尾端寫進 SQLite）。
+
 ### 配置檔：`~/.ctx-save/config.json`
 
 ```json
@@ -166,7 +177,33 @@ python3 .../ctx-db.py migrate
 }
 ```
 
-> 為什麼 `auto_dump_threshold=70`？實測 Claude Code 大約在 **75% 就會自動觸發 compact**，所以要搶在 75% 前完成 dump，留 5% 緩衝。
+#### 欄位說明
+
+| 欄位 | 預設 | 說明 |
+|------|------|------|
+| `mode` | `assist` | 觸發模式：`off` / `assist` / `auto`（見上表） |
+| `alert_threshold` | `60` | Context 使用率達多少百分比時提醒（1-99）。預設 60 意味著還有 40% 緩衝 |
+| `auto_dump_threshold` | `70` | `auto` 模式下，使用率達多少百分比時自動 raw dump（1-99）。**必須 ≥ alert_threshold** |
+| `cooldown_minutes` | `15` | 提醒／主動 dump 的節流間隔（>=0 分鐘）。避免連續洗頻，詳見下段 |
+| `dump_strategy` | `raw_all` | 保留全部 raw 對話。目前只支援此值（未來可擴 summary 策略） |
+| `transcript_tail_kb` | `200` | 每次 dump 從 transcript 尾端讀多少 KB（>=1）。200 KB 約等於 50k tokens |
+
+> **為什麼 `auto_dump_threshold=70`？** 實測 Claude Code 大約在 **75% 就會自動觸發 compact**，所以要搶在 75% 前完成 dump，留 5% 緩衝。若你發現常常沒來得及主動 dump 就被壓縮，調成 65 或更低。
+
+#### 冷卻時間（`cooldown_minutes`）行為
+
+每次觸發提醒或主動 dump 後，`/tmp/claude/ctx-alert-cooldown` 與 `/tmp/claude/ctx-autodump-cooldown` 各自記錄一個時間戳。下一次 PostToolUse hook 讀到 timestamp 距今未滿 `cooldown_minutes`，就**靜默跳過**（不提醒、不 dump）。
+
+| 情境 | 行為 |
+|------|------|
+| `assist` 超過閾值提醒一次 | 15 分鐘內不再提醒（即使一直 60%+） |
+| `auto` 超過 dump 閾值主動 dump 一次 | 15 分鐘內不再主動 dump |
+| PreCompact 保底 dump | **不受冷卻限制**（保底永遠優先） |
+| 你手動 `/ctx-save` | **不受冷卻限制**（手動永遠可執行） |
+
+設 0 = 每次都觸發（通常太吵）。想更靈敏：`/ctx-mode cooldown 5`；想更安靜：`/ctx-mode cooldown 30`。
+
+手動清除冷卻：`rm /tmp/claude/ctx-alert-cooldown /tmp/claude/ctx-autodump-cooldown`。
 
 #### 修改配置
 
