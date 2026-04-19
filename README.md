@@ -85,6 +85,35 @@ claude plugin update <plugin-name>@forge
 
 ---
 
+## 開發者：版本管理
+
+**單一真相來源**：每個 `plugins/<name>/.claude-plugin/plugin.json` 的 `version` 欄位。`marketplace.json` 內對應的 `version` 是派生值。
+
+升版流程：
+
+```bash
+# 1. 修改對應 plugin.json 的 version
+# 2. 同步到 marketplace.json
+python3 scripts/sync-versions.py
+
+# 3. commit（pre-commit hook 會再驗證一次）
+git add . && git commit -m "chore(ctx-save): 升版 2.3.2"
+```
+
+首次 clone 後啟用 hook：
+
+```bash
+git config core.hooksPath .githooks
+```
+
+驗證（CI / 手動）：
+
+```bash
+python3 scripts/sync-versions.py --check  # 不一致 → exit 1
+```
+
+---
+
 ## 授權
 
 MIT License

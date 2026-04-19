@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# 版本一致性守門：commit 前跑 sync-versions --check，漂移時擋下。
+#
+# 啟用方式（在 repo 根目錄執行一次）：
+#   git config core.hooksPath .githooks
+
+set -e
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+SCRIPT="$REPO_ROOT/scripts/sync-versions.py"
+
+if [[ -f "$SCRIPT" ]]; then
+    if ! python3 "$SCRIPT" --check; then
+        echo "" >&2
+        echo "💡 提示：執行 python3 scripts/sync-versions.py 自動同步後再 commit。" >&2
+        exit 1
+    fi
+fi
