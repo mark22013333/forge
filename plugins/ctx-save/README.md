@@ -2,9 +2,13 @@
 
 > 在 Claude Code 自動壓縮前，保存對話重點。支援 Markdown 與 SQLite 儲存、PostToolUse Hook 自動提醒、Web Viewer 視覺化瀏覽。
 
-**版本**：2.0.0
+**版本**：2.3.0
 **技術棧**：Python 3 標準庫（無任何 pip 依賴）
 **授權**：MIT
+
+> **v2.3 新增**：`/ctx-mode` 一鍵切換觸發模式，不用再手敲長指令。例如手機遠端打 `/ctx-mode auto` 即可開啟自動 dump。
+>
+> **v2.2 新增**：內建 Hook 自動註冊（安裝即生效）+ PreCompact 保底 raw dump + 三種觸發模式（off/assist/auto），適合「手機遠端、context 接近滿 + 無法手動干預」的場景。
 
 ---
 
@@ -129,29 +133,68 @@ python3 .../ctx-db.py migrate
 | `~/.cache/ctx-viewer/viewer.pid` | Web Viewer PID file |
 | `~/.cache/ctx-viewer/viewer.log` | Web Viewer 日誌 |
 
-### 自動提醒 Hook（選配）
+### 自動提醒與保底 Hook（v2.2 內建）
 
-在 Claude Code 的 `settings.json` 加入 PostToolUse hook，context 超過 80% 時自動提示執行 `/ctx-save`：
+**好消息**：v2.2 以後安裝 plugin 會自動註冊下列 hook（`.claude-plugin/hooks.json`），不需手動改 `settings.json`：
+
+| Hook | 時機 | 作用 |
+|------|------|------|
+| `PostToolUse` | 每次工具呼叫後 | 讀 statusline，超過 alert 閾值時提醒；auto 模式下超過 dump 閾值自動觸發 raw dump |
+| `PreCompact` | Claude Code 壓縮對話前 | **無條件**把 transcript 尾端 raw dump 進 SQLite（保底） |
+| `SessionStart` | 新 session 啟動 | 若 `~/.ctx-save/config.json` 不存在則寫入預設值 |
+
+### 三種觸發模式
+
+| mode | 用途 | 行為 |
+|------|------|------|
+| `off` | 完全關閉 alert/dump（PreCompact 保底仍會生效） | 不主動輸出任何提醒 |
+| `assist`（預設） | 只提醒 | 超過 alert_threshold 輸出一行提示 |
+| `auto` | 無人值守 | 超過 alert_threshold 提醒；超過 auto_dump_threshold 自動 raw dump（category=`auto-dump`） |
+
+**何時選 auto？** 當你透過手機或遠端控制 Claude Code，context 快滿但沒人能即時手動 `/ctx-save` 的情境 — 讓 auto mode 替你保底。
+
+### 配置檔：`~/.ctx-save/config.json`
 
 ```json
 {
-  "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": ".*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude-company/plugins/marketplaces/forge/plugins/ctx-save/skills/ctx-save/scripts/ctx-alert.sh"
-          }
-        ]
-      }
-    ]
-  }
+  "mode": "assist",
+  "alert_threshold": 60,
+  "auto_dump_threshold": 70,
+  "cooldown_minutes": 15,
+  "dump_strategy": "raw_all",
+  "transcript_tail_kb": 200
 }
 ```
 
-詳細設定請見 `skills/ctx-save/references/hook-setup.md`。
+> 為什麼 `auto_dump_threshold=70`？實測 Claude Code 大約在 **75% 就會自動觸發 compact**，所以要搶在 75% 前完成 dump，留 5% 緩衝。
+
+#### 修改配置
+
+**推薦：用 `/ctx-mode` slash command**（v2.3+）
+
+```
+/ctx-mode              # 查看當前配置
+/ctx-mode auto         # 切換到 auto 模式
+/ctx-mode assist       # 切回 assist
+/ctx-mode off          # 全部關閉
+/ctx-mode alert 55     # 改提醒閾值
+/ctx-mode dump 68      # 改 auto-dump 閾值
+/ctx-mode cooldown 10  # 改冷卻分鐘
+/ctx-mode tail 300     # 改 transcript 尾端 KB
+```
+
+**進階：直接呼叫 ctx-config.py**
+
+```bash
+python3 ~/.claude-company/plugins/marketplaces/forge/plugins/ctx-save/scripts/ctx-config.py set mode auto
+python3 ~/.claude-company/plugins/marketplaces/forge/plugins/ctx-save/scripts/ctx-config.py get-all
+```
+
+或直接編輯 `~/.ctx-save/config.json`（下次 hook 觸發時生效，不用重啟）。
+
+### Legacy shell hook（手動安裝）
+
+若你之前用 `skills/ctx-save/scripts/ctx-alert.sh` 手動設定 PostToolUse，v2.2 後可以移除 settings.json 裡那段 — plugin 自動註冊的版本功能更強（支援三模式 + auto-dump）。原 shell 檔案保留給離線/特殊環境使用，不讀 config。
 
 ---
 
@@ -162,6 +205,7 @@ python3 .../ctx-db.py migrate
 | `ctx-save` | 手動 | 在 Claude Code 中用 `/ctx-save` 觸發儲存 |
 | `ctx-view` | User-invocable | `/ctx-view` 背景啟動 Web Viewer |
 | `ctx-view-stop` | User-invocable | `/ctx-view-stop` 停止 Web Viewer |
+| `ctx-mode` | User-invocable | `/ctx-mode` 一鍵切換觸發模式與閾值 |
 
 ---
 
