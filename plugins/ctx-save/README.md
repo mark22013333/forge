@@ -2,10 +2,12 @@
 
 > 在 Claude Code 自動壓縮前，保存對話重點。支援 Markdown 與 SQLite 儲存、PostToolUse Hook 自動提醒、Web Viewer 視覺化瀏覽。
 
-**版本**：2.2.0
+**版本**：2.3.0
 **技術棧**：Python 3 標準庫（無任何 pip 依賴）
 **授權**：MIT
 
+> **v2.3 新增**：`/ctx-mode` 一鍵切換觸發模式，不用再手敲長指令。例如手機遠端打 `/ctx-mode auto` 即可開啟自動 dump。
+>
 > **v2.2 新增**：內建 Hook 自動註冊（安裝即生效）+ PreCompact 保底 raw dump + 三種觸發模式（off/assist/auto），適合「手機遠端、context 接近滿 + 無法手動干預」的場景。
 
 ---
@@ -168,14 +170,23 @@ python3 .../ctx-db.py migrate
 
 #### 修改配置
 
+**推薦：用 `/ctx-mode` slash command**（v2.3+）
+
+```
+/ctx-mode              # 查看當前配置
+/ctx-mode auto         # 切換到 auto 模式
+/ctx-mode assist       # 切回 assist
+/ctx-mode off          # 全部關閉
+/ctx-mode alert 55     # 改提醒閾值
+/ctx-mode dump 68      # 改 auto-dump 閾值
+/ctx-mode cooldown 10  # 改冷卻分鐘
+/ctx-mode tail 300     # 改 transcript 尾端 KB
+```
+
+**進階：直接呼叫 ctx-config.py**
+
 ```bash
-# 切到 auto 模式（讓 hook 自動 dump）
 python3 ~/.claude-company/plugins/marketplaces/forge/plugins/ctx-save/scripts/ctx-config.py set mode auto
-
-# 調整閾值
-python3 ~/.claude-company/plugins/marketplaces/forge/plugins/ctx-save/scripts/ctx-config.py set auto_dump_threshold 68
-
-# 查看當前配置
 python3 ~/.claude-company/plugins/marketplaces/forge/plugins/ctx-save/scripts/ctx-config.py get-all
 ```
 
@@ -194,6 +205,7 @@ python3 ~/.claude-company/plugins/marketplaces/forge/plugins/ctx-save/scripts/ct
 | `ctx-save` | 手動 | 在 Claude Code 中用 `/ctx-save` 觸發儲存 |
 | `ctx-view` | User-invocable | `/ctx-view` 背景啟動 Web Viewer |
 | `ctx-view-stop` | User-invocable | `/ctx-view-stop` 停止 Web Viewer |
+| `ctx-mode` | User-invocable | `/ctx-mode` 一鍵切換觸發模式與閾值 |
 
 ---
 

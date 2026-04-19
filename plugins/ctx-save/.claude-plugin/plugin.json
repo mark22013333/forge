@@ -1,7 +1,7 @@
 {
   "name": "ctx-save",
-  "description": "Context Save — 在 Claude Code 自動壓縮前保存對話重點。支援 Markdown 與 SQLite 儲存，內建 Hook 自動提醒 + PreCompact 保底 raw dump；提供 Web Viewer 視覺化瀏覽、刪除、複製記錄。",
-  "version": "2.2.0",
+  "description": "Context Save — 在 Claude Code 自動壓縮前保存對話重點。支援 Markdown 與 SQLite 儲存，內建 Hook 自動提醒 + PreCompact 保底 raw dump；提供 Web Viewer 視覺化瀏覽、刪除、複製記錄；一鍵 /ctx-mode 切換觸發模式。",
+  "version": "2.3.0",
   "author": {
     "name": "Cheng"
   },
@@ -10,7 +10,8 @@
   "skills": [
     "./skills/ctx-save",
     "./skills/ctx-view",
-    "./skills/ctx-view-stop"
+    "./skills/ctx-view-stop",
+    "./skills/ctx-mode"
   ],
   "keywords": [
     "context",
