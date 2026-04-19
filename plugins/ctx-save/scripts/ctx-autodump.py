@@ -23,7 +23,7 @@ import re
 import subprocess
 import sys
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
@@ -80,7 +80,7 @@ def read_tail(path: Path, tail_bytes: int) -> str:
 def sanitize_session_id(raw: str) -> str:
     if raw and SESSION_ID_REGEX.match(raw):
         return raw
-    return "autodump" + datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    return "autodump" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
 
 
 def build_record(payload: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
