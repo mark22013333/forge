@@ -3,6 +3,11 @@
 .spec/*
 !.spec/_index.md
 !.spec/centralized-db/
+!.spec/ctx-save-v3/
+
+# Claude Code project lock / Playwright temp
+.claude/
+.playwright-mcp/
 
 # ctx-save runtime database
 .ctx-save/
