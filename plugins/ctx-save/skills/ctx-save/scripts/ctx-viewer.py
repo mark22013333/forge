@@ -27,6 +27,7 @@ import os
 import re
 import secrets
 import sqlite3
+import subprocess
 import sys
 import traceback
 import webbrowser
@@ -40,7 +41,7 @@ from urllib.parse import urlparse, parse_qs
 # 模組級常數（arch.md §2.2.1）
 # --------------------------------------------------------------------------
 
-VERSION = "2.1.0"
+VERSION = "3.0.0"
 SERVICE_NAME = "ctx-viewer"
 STARTED_AT = datetime.utcnow().isoformat() + "Z"
 CONFIRM_SECRET = secrets.token_bytes(32)
@@ -109,6 +110,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     --warn: #d29922;
     --danger: #f85149;
     --purple: #bc8cff;
+    --pink: #db61a2;
     --radius: 8px;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -394,10 +396,138 @@ HTML_PAGE = r"""<!DOCTYPE html>
     to { opacity: 0; transform: translateY(10px); }
   }
 
+  /* ---- v3：四 Tab dashboard ---- */
+
+  .dash-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 16px;
+  }
+  .dash-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 16px;
+  }
+  .dash-card h3 {
+    font-size: 14px; color: var(--text2); margin-bottom: 12px;
+    font-weight: 600; letter-spacing: 0.02em;
+  }
+  .dash-score {
+    font-size: 56px; font-weight: 700; line-height: 1;
+  }
+  .dash-score.good { color: var(--accent2); }
+  .dash-score.mid  { color: var(--warn); }
+  .dash-score.bad  { color: var(--danger); }
+  .dash-score-sub { font-size: 13px; color: var(--text2); margin-top: 6px; }
+
+  .pie-wrap { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+  .pie-legend { flex: 1; min-width: 160px; font-size: 13px; }
+  .pie-legend .row {
+    display: flex; align-items: center; gap: 8px; padding: 4px 0;
+  }
+  .pie-legend .swatch {
+    width: 12px; height: 12px; border-radius: 2px; flex-shrink: 0;
+  }
+  .pie-legend .pct {
+    margin-left: auto; color: var(--text2); font-variant-numeric: tabular-nums;
+  }
+
+  .findings-list { display: flex; flex-direction: column; gap: 8px; }
+  .finding-item {
+    background: var(--bg); border: 1px solid var(--border);
+    border-left: 3px solid var(--text2);
+    border-radius: 4px; padding: 10px 12px; font-size: 13px;
+  }
+  .finding-item.sev-high   { border-left-color: var(--danger); }
+  .finding-item.sev-medium { border-left-color: var(--warn); }
+  .finding-item.sev-low    { border-left-color: var(--accent2); }
+  .finding-title {
+    font-weight: 600; margin-bottom: 4px;
+    display: flex; gap: 8px; align-items: center;
+  }
+  .finding-sev-badge {
+    font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 8px;
+    background: var(--surface2); text-transform: uppercase;
+  }
+  .finding-sev-badge.sev-high   { background: rgba(248, 81, 73, 0.15); color: var(--danger); }
+  .finding-sev-badge.sev-medium { background: rgba(210, 153, 34, 0.15); color: var(--warn); }
+  .finding-sev-badge.sev-low    { background: rgba(63, 185, 80, 0.15); color: var(--accent2); }
+  .finding-detail { color: var(--text2); }
+
+  /* Timeline SVG */
+  .timeline-wrap {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 16px; margin-top: 12px;
+    overflow-x: auto;
+  }
+  .timeline-svg { width: 100%; min-height: 240px; display: block; }
+  .timeline-svg .axis-line  { stroke: var(--border); stroke-width: 1; }
+  .timeline-svg .axis-label { fill: var(--text2); font-size: 10px; font-family: inherit; }
+  .timeline-svg .event      { cursor: pointer; transition: r 0.1s; }
+  .timeline-svg .event:hover { filter: brightness(1.3); }
+  .timeline-svg .lane-label {
+    fill: var(--text2); font-size: 11px;
+  }
+  .timeline-tooltip {
+    position: absolute; background: var(--surface2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 6px 10px; font-size: 12px; pointer-events: none;
+    white-space: nowrap; z-index: 10; display: none;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  }
+
+  /* Diagnostics */
+  .diag-list { display: flex; flex-direction: column; gap: 10px; }
+  .diag-row {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 12px 16px; cursor: pointer;
+    transition: background 0.15s;
+  }
+  .diag-row:hover { background: var(--surface2); }
+  .diag-row-head {
+    display: flex; align-items: center; gap: 12px; justify-content: space-between;
+  }
+  .diag-meta { font-size: 12px; color: var(--text2); margin-top: 4px; }
+  .diag-detail {
+    margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);
+    display: none;
+  }
+  .diag-row.expanded .diag-detail { display: block; }
+
+  /* Persistent */
+  .pin-list { display: flex; flex-direction: column; gap: 10px; }
+  .pin-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 14px 16px;
+  }
+  .pin-card-head {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
+  }
+  .pin-card-title { font-size: 15px; font-weight: 600; flex: 1; }
+  .pin-card-meta { font-size: 12px; color: var(--text2); }
+  .pin-card-body {
+    font-size: 13px; line-height: 1.6; color: var(--text2);
+    margin-top: 8px; max-height: 180px; overflow: hidden;
+    position: relative;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .pin-card-actions {
+    margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap;
+  }
+
+  .empty-hint {
+    background: var(--surface); border: 1px dashed var(--border);
+    border-radius: var(--radius); padding: 40px; text-align: center;
+    color: var(--text2); font-size: 14px;
+  }
+  .empty-hint .icon { font-size: 40px; opacity: 0.5; margin-bottom: 12px; }
+
+  .full-content { padding: 24px; }
+
   @media (max-width: 768px) {
     .main { flex-direction: column; }
     .sidebar { width: 100%; min-width: unset; max-height: 40vh; }
     .header-sub { display: none; }
+    .tabs { overflow-x: auto; }
+    .tab { white-space: nowrap; }
   }
 </style>
 </head>
@@ -412,8 +542,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 
 <div class="tabs">
-  <div class="tab active" data-tab="sessions">Sessions</div>
-  <div class="tab" data-tab="stats">Stats</div>
+  <div class="tab" data-tab="dashboard">&#128202; Dashboard</div>
+  <div class="tab" data-tab="timeline">&#9201; Timeline</div>
+  <div class="tab" data-tab="diagnostics">&#129658; Diagnostics</div>
+  <div class="tab" data-tab="persistent">&#128274; Persistent</div>
+  <div class="tab active" data-tab="saves">&#128220; Saves</div>
+  <div class="tab" data-tab="stats">&#128200; Stats</div>
 </div>
 
 <div class="main">
@@ -742,6 +876,22 @@ function renderSessionRow(session) {
   countBadge.textContent = (session.item_count || 0) + ' 項';
   metaEl.appendChild(countBadge);
 
+  // v3：標示含 persistent / reinjected 的 session
+  if (session.has_persistent) {
+    const pin = document.createElement('span');
+    pin.className = 'category-badge';
+    pin.textContent = '🔒';
+    pin.title = '含 persistent 筆記';
+    metaEl.appendChild(pin);
+  }
+  if (session.has_reinjected) {
+    const ri = document.createElement('span');
+    ri.className = 'category-badge';
+    ri.textContent = '🔄';
+    ri.title = '曾被 auto-reinject';
+    metaEl.appendChild(ri);
+  }
+
   row.appendChild(metaEl);
   return row;
 }
@@ -935,6 +1085,41 @@ function renderRecordCard(r) {
     if (Number.isInteger(id)) copyMarkdown(id);
   });
   actions.appendChild(btnMd);
+
+  // v3：pin / unpin 切換
+  const isPinned = !!r.is_persistent;
+  const btnPin = document.createElement('button');
+  btnPin.className = 'btn-action';
+  btnPin.textContent = isPinned ? '🔓 取消釘選' : '🔒 釘選';
+  btnPin.dataset.recordId = String(r.id);
+  btnPin.dataset.pinned = isPinned ? '1' : '0';
+  btnPin.addEventListener('click', async (e) => {
+    const id = parseInt(e.currentTarget.dataset.recordId, 10);
+    const nowPinned = e.currentTarget.dataset.pinned === '1';
+    const ok = await togglePin(id, !nowPinned);
+    if (ok) {
+      // 局部更新：切換按鈕狀態，避免整體 reload
+      const next = !nowPinned;
+      e.currentTarget.dataset.pinned = next ? '1' : '0';
+      e.currentTarget.textContent = next ? '🔓 取消釘選' : '🔒 釘選';
+      if (currentSessionId && allRecords[currentSessionId]) {
+        const rec = allRecords[currentSessionId].find(x => x.id === id);
+        if (rec) rec.is_persistent = next ? 1 : 0;
+      }
+    }
+  });
+  actions.appendChild(btnPin);
+
+  // v3：distill 觸發
+  const btnDistill = document.createElement('button');
+  btnDistill.className = 'btn-action';
+  btnDistill.innerHTML = '&#9986; Distill';
+  btnDistill.dataset.recordId = String(r.id);
+  btnDistill.addEventListener('click', (e) => {
+    const id = parseInt(e.currentTarget.dataset.recordId, 10);
+    if (Number.isInteger(id)) triggerDistill(id);
+  });
+  actions.appendChild(btnDistill);
 
   card.appendChild(actions);
   return card;
@@ -1292,17 +1477,789 @@ function resetContentPanel() {
   content.appendChild(empty);
 }
 
-function switchTab(tab) {
+const TAB_NAMES = new Set([
+  'dashboard', 'timeline', 'diagnostics', 'persistent', 'saves', 'stats'
+]);
+let currentTab = 'saves';
+
+function switchTab(tab, opts) {
+  if (!TAB_NAMES.has(tab)) tab = 'saves';
+  currentTab = tab;
   document.querySelectorAll('.tab').forEach(t => {
     t.classList.toggle('active', t.dataset.tab === tab);
   });
+
   const sidebar = document.getElementById('sidebarPanel');
-  if (tab === 'stats') {
-    sidebar.style.display = 'none';
-    renderStats();
-  } else {
+  // Saves tab 保留既有 sidebar；其他 tab 隱藏並全寬呈現
+  if (tab === 'saves') {
     sidebar.style.display = '';
     resetContentPanel();
+  } else {
+    sidebar.style.display = 'none';
+  }
+
+  // hash 更新（除非是 hashchange 觸發）
+  if (!opts || !opts.fromHash) {
+    const next = '#/' + tab;
+    if (location.hash !== next) {
+      history.replaceState(null, '', next);
+    }
+  }
+
+  if (tab === 'dashboard')       renderDashboard();
+  else if (tab === 'timeline')    renderTimeline();
+  else if (tab === 'diagnostics') renderDiagnostics();
+  else if (tab === 'persistent')  renderPersistent();
+  else if (tab === 'stats')       renderStats();
+  // saves 已於 resetContentPanel 處理
+}
+
+function handleHashRoute() {
+  const h = (location.hash || '').replace(/^#\/?/, '').split('/')[0] || 'saves';
+  switchTab(h, { fromHash: true });
+}
+
+/* ---------------- v3：Dashboard ---------------- */
+
+const TOKEN_CLASSES = [
+  { key: 'tokens_conversation',  label: '對話',        color: '#58a6ff' },
+  { key: 'tokens_files',         label: '檔案讀取',    color: '#3fb950' },
+  { key: 'tokens_tools_schema',  label: '工具 schema', color: '#bc8cff' },
+  { key: 'tokens_tools_runtime', label: '工具 runtime',color: '#d29922' },
+  { key: 'tokens_system',        label: '系統提示',    color: '#db61a2' },
+];
+
+async function renderDashboard() {
+  const content = document.getElementById('contentPanel');
+  content.innerHTML = '';
+  content.classList.add('full-content');
+
+  const data = await fetchAPI('dashboard/health', {
+    project_path: currentProjectFilter,
+  });
+  if (!data) {
+    content.appendChild(renderEmptyHint('📊', '無法載入 Dashboard'));
+    return;
+  }
+
+  const grid = document.createElement('div');
+  grid.className = 'dash-grid';
+
+  // 1. 最新健康分
+  const scoreCard = document.createElement('div');
+  scoreCard.className = 'dash-card';
+  const h1 = document.createElement('h3');
+  h1.textContent = '最新健康分';
+  scoreCard.appendChild(h1);
+  const latest = data.latest_diagnosis;
+  if (latest && latest.score != null) {
+    const scoreEl = document.createElement('div');
+    scoreEl.className = 'dash-score ' + scoreLevel(latest.score);
+    scoreEl.textContent = String(latest.score);
+    scoreCard.appendChild(scoreEl);
+    const sub = document.createElement('div');
+    sub.className = 'dash-score-sub';
+    const ctxPct = latest.context_percentage != null ?
+      ` · context ${latest.context_percentage}%` : '';
+    sub.textContent = `${formatDate(latest.ran_at)}${ctxPct}`;
+    scoreCard.appendChild(sub);
+
+    // 複製 focus hint 按鈕
+    if (latest.suggest_focus) {
+      const btn = document.createElement('button');
+      btn.className = 'btn-action';
+      btn.style.marginTop = '12px';
+      btn.innerHTML = '&#128203; 複製 /compact focus hint';
+      btn.addEventListener('click', async () => {
+        const ok = await copyToClipboard(
+          '/compact focus on ' + latest.suggest_focus
+        );
+        showToast(ok ? '已複製' : '複製失敗', ok ? 'success' : 'error');
+      });
+      scoreCard.appendChild(btn);
+    }
+  } else {
+    scoreCard.appendChild(renderEmptyHint('🩺', '尚無診斷紀錄。切到 Diagnostics → 執行 analyze'));
+  }
+  grid.appendChild(scoreCard);
+
+  // 2. Token 組成圓餅圖
+  const pieCard = document.createElement('div');
+  pieCard.className = 'dash-card';
+  const h2 = document.createElement('h3');
+  h2.textContent = 'Token 組成（最新 session）';
+  pieCard.appendChild(h2);
+  if (latest) {
+    pieCard.appendChild(renderTokenPie(latest));
+  } else {
+    pieCard.appendChild(renderEmptyHint('📊', '尚無資料'));
+  }
+  grid.appendChild(pieCard);
+
+  // 3. 近 30 天 auto-dump 次數
+  const saves = data.saves_stats || {};
+  const dumpCard = document.createElement('div');
+  dumpCard.className = 'dash-card';
+  const h3 = document.createElement('h3');
+  h3.textContent = `近 ${saves.days || 30} 天 auto-dump`;
+  dumpCard.appendChild(h3);
+  const dumpNum = document.createElement('div');
+  dumpNum.className = 'dash-score';
+  dumpNum.style.color = 'var(--accent)';
+  dumpNum.textContent = String(saves.autodump_total || 0);
+  dumpCard.appendChild(dumpNum);
+  const prev = saves.autodump_prev_period || 0;
+  const cur = saves.autodump_total || 0;
+  const sub = document.createElement('div');
+  sub.className = 'dash-score-sub';
+  const trend = prev === 0 ? '—' :
+    (cur >= prev ? `↑ ${(((cur - prev) / prev) * 100).toFixed(0)}%` :
+                   `↓ ${(((prev - cur) / prev) * 100).toFixed(0)}%`);
+  sub.textContent = `上期 ${prev} 次 · ${trend}`;
+  dumpCard.appendChild(sub);
+  const jumpBtn = document.createElement('button');
+  jumpBtn.className = 'btn-action';
+  jumpBtn.style.marginTop = '12px';
+  jumpBtn.innerHTML = '&#9201; 查看時間軸';
+  jumpBtn.addEventListener('click', () => switchTab('timeline'));
+  dumpCard.appendChild(jumpBtn);
+  grid.appendChild(dumpCard);
+
+  // 4. Findings 卡片
+  const findCard = document.createElement('div');
+  findCard.className = 'dash-card';
+  const h4 = document.createElement('h3');
+  h4.textContent = '健康提醒';
+  findCard.appendChild(h4);
+  const findings = (latest && latest.findings) || [];
+  if (findings.length) {
+    const list = document.createElement('div');
+    list.className = 'findings-list';
+    findings.slice(0, 5).forEach(f => list.appendChild(renderFindingItem(f)));
+    findCard.appendChild(list);
+    if (findings.length > 5) {
+      const more = document.createElement('div');
+      more.style.marginTop = '8px';
+      more.style.fontSize = '12px';
+      more.style.color = 'var(--text2)';
+      more.textContent = `還有 ${findings.length - 5} 條（至 Diagnostics 看完整）`;
+      findCard.appendChild(more);
+    }
+  } else {
+    findCard.appendChild(renderEmptyHint('✨', '目前無異常'));
+  }
+  grid.appendChild(findCard);
+
+  content.appendChild(grid);
+}
+
+function scoreLevel(score) {
+  if (score >= 80) return 'good';
+  if (score >= 50) return 'mid';
+  return 'bad';
+}
+
+function renderTokenPie(latest) {
+  const values = TOKEN_CLASSES.map(c => ({
+    label: c.label, color: c.color, value: Number(latest[c.key] || 0),
+  }));
+  const total = values.reduce((a, b) => a + b.value, 0);
+  const wrap = document.createElement('div');
+  wrap.className = 'pie-wrap';
+
+  const size = 160;
+  const r = 70;
+  const cx = size / 2;
+  const cy = size / 2;
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('width', String(size));
+  svg.setAttribute('height', String(size));
+  svg.setAttribute('viewBox', `0 0 ${size} ${size}`);
+
+  if (total === 0) {
+    const circ = document.createElementNS(ns, 'circle');
+    circ.setAttribute('cx', String(cx));
+    circ.setAttribute('cy', String(cy));
+    circ.setAttribute('r', String(r));
+    circ.setAttribute('fill', 'none');
+    circ.setAttribute('stroke', 'var(--border)');
+    circ.setAttribute('stroke-width', '20');
+    svg.appendChild(circ);
+  } else {
+    let start = -Math.PI / 2;
+    values.forEach(v => {
+      if (v.value === 0) return;
+      const slice = (v.value / total) * Math.PI * 2;
+      const end = start + slice;
+      const large = slice > Math.PI ? 1 : 0;
+      const x1 = cx + r * Math.cos(start);
+      const y1 = cy + r * Math.sin(start);
+      const x2 = cx + r * Math.cos(end);
+      const y2 = cy + r * Math.sin(end);
+      const path = document.createElementNS(ns, 'path');
+      path.setAttribute('d', [
+        `M ${cx} ${cy}`,
+        `L ${x1.toFixed(2)} ${y1.toFixed(2)}`,
+        `A ${r} ${r} 0 ${large} 1 ${x2.toFixed(2)} ${y2.toFixed(2)}`,
+        'Z',
+      ].join(' '));
+      path.setAttribute('fill', v.color);
+      svg.appendChild(path);
+      start = end;
+    });
+  }
+  wrap.appendChild(svg);
+
+  const legend = document.createElement('div');
+  legend.className = 'pie-legend';
+  values.forEach(v => {
+    const row = document.createElement('div');
+    row.className = 'row';
+    const sw = document.createElement('span');
+    sw.className = 'swatch';
+    sw.style.background = v.color;
+    row.appendChild(sw);
+    const lbl = document.createElement('span');
+    lbl.textContent = v.label;
+    row.appendChild(lbl);
+    const pct = document.createElement('span');
+    pct.className = 'pct';
+    pct.textContent = total > 0 ?
+      `${((v.value / total) * 100).toFixed(1)}%` : '—';
+    row.appendChild(pct);
+    legend.appendChild(row);
+  });
+  wrap.appendChild(legend);
+  return wrap;
+}
+
+function renderFindingItem(f) {
+  const item = document.createElement('div');
+  const sev = (f.severity || 'low').toLowerCase();
+  item.className = 'finding-item sev-' + sev;
+
+  const title = document.createElement('div');
+  title.className = 'finding-title';
+  const badge = document.createElement('span');
+  badge.className = 'finding-sev-badge sev-' + sev;
+  badge.textContent = sev;
+  title.appendChild(badge);
+  const ttl = document.createElement('span');
+  ttl.textContent = f.title || f.rule || '(未命名)';
+  title.appendChild(ttl);
+  item.appendChild(title);
+
+  if (f.detail || f.message) {
+    const d = document.createElement('div');
+    d.className = 'finding-detail';
+    d.textContent = f.detail || f.message || '';
+    item.appendChild(d);
+  }
+  if (f.suggestion) {
+    const s = document.createElement('div');
+    s.className = 'finding-detail';
+    s.style.marginTop = '4px';
+    s.textContent = '→ ' + f.suggestion;
+    item.appendChild(s);
+  }
+  return item;
+}
+
+function renderEmptyHint(iconText, msg) {
+  const box = document.createElement('div');
+  box.className = 'empty-hint';
+  const icon = document.createElement('div');
+  icon.className = 'icon';
+  icon.textContent = iconText;
+  box.appendChild(icon);
+  const m = document.createElement('div');
+  m.textContent = msg;
+  box.appendChild(m);
+  return box;
+}
+
+/* ---------------- v3：Timeline ---------------- */
+
+async function renderTimeline() {
+  const content = document.getElementById('contentPanel');
+  content.innerHTML = '';
+  content.classList.add('full-content');
+
+  const title = document.createElement('h2');
+  title.style.marginBottom = '12px';
+  title.textContent = 'Compact 事件時間軸（近 30 天）';
+  content.appendChild(title);
+
+  const data = await fetchAPI('compact-events', {
+    project_path: currentProjectFilter,
+    days: 30,
+  });
+  const events = (data && data.events) || [];
+  if (!events.length) {
+    content.appendChild(renderEmptyHint('⏱', '近 30 天無 compact 事件'));
+    return;
+  }
+
+  const meta = document.createElement('div');
+  meta.style.fontSize = '12px';
+  meta.style.color = 'var(--text2)';
+  meta.style.marginBottom = '8px';
+  meta.textContent = `共 ${events.length} 筆 · 資料來源 ${data.source || '?'}`;
+  content.appendChild(meta);
+
+  content.appendChild(renderTimelineSVG(events));
+}
+
+function renderTimelineSVG(events) {
+  const wrap = document.createElement('div');
+  wrap.className = 'timeline-wrap';
+  wrap.style.position = 'relative';
+
+  const tooltip = document.createElement('div');
+  tooltip.className = 'timeline-tooltip';
+  wrap.appendChild(tooltip);
+
+  // 降採樣：超過 500 點用步長抽樣
+  let sampled = events;
+  if (events.length > 500) {
+    const step = Math.ceil(events.length / 500);
+    sampled = events.filter((_, i) => i % step === 0);
+  }
+
+  // 取時間範圍（毫秒）
+  const times = sampled.map(e => new Date(e.happened_at).getTime())
+                       .filter(n => !isNaN(n));
+  if (!times.length) {
+    wrap.appendChild(renderEmptyHint('⏱', '事件時間無法解析'));
+    return wrap;
+  }
+  const tMin = Math.min.apply(null, times);
+  const tMax = Math.max.apply(null, times);
+  const tRange = Math.max(tMax - tMin, 1);
+
+  // 按 session 分泳道
+  const sessions = [];
+  const sessionIdx = {};
+  sampled.forEach(e => {
+    const sid = e.session_id || '(unknown)';
+    if (!(sid in sessionIdx)) {
+      sessionIdx[sid] = sessions.length;
+      sessions.push(sid);
+    }
+  });
+  const laneCount = sessions.length;
+
+  const width = 920;
+  const laneH = 34;
+  const padL = 140;
+  const padR = 24;
+  const padT = 24;
+  const padB = 36;
+  const height = padT + laneCount * laneH + padB;
+
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('class', 'timeline-svg');
+  svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+
+  // 基準線 + lane label
+  for (let i = 0; i < laneCount; i++) {
+    const y = padT + i * laneH + laneH / 2;
+    const line = document.createElementNS(ns, 'line');
+    line.setAttribute('class', 'axis-line');
+    line.setAttribute('x1', String(padL));
+    line.setAttribute('x2', String(width - padR));
+    line.setAttribute('y1', String(y));
+    line.setAttribute('y2', String(y));
+    svg.appendChild(line);
+
+    const lbl = document.createElementNS(ns, 'text');
+    lbl.setAttribute('class', 'lane-label');
+    lbl.setAttribute('x', String(padL - 8));
+    lbl.setAttribute('y', String(y + 3));
+    lbl.setAttribute('text-anchor', 'end');
+    lbl.textContent = sessions[i].slice(0, 14);
+    const ttl = document.createElementNS(ns, 'title');
+    ttl.textContent = sessions[i];
+    lbl.appendChild(ttl);
+    svg.appendChild(lbl);
+  }
+
+  // 時間軸刻度（5 等分）
+  for (let k = 0; k <= 4; k++) {
+    const x = padL + ((width - padR - padL) * k) / 4;
+    const t = tMin + (tRange * k) / 4;
+    const d = new Date(t);
+    const tick = document.createElementNS(ns, 'text');
+    tick.setAttribute('class', 'axis-label');
+    tick.setAttribute('x', String(x));
+    tick.setAttribute('y', String(height - padB + 18));
+    tick.setAttribute('text-anchor', 'middle');
+    const pad = n => String(n).padStart(2, '0');
+    tick.textContent = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+    svg.appendChild(tick);
+  }
+
+  // 畫事件圓點
+  sampled.forEach(e => {
+    const t = new Date(e.happened_at).getTime();
+    if (isNaN(t)) return;
+    const x = padL + ((t - tMin) / tRange) * (width - padR - padL);
+    const laneI = sessionIdx[e.session_id || '(unknown)'];
+    const y = padT + laneI * laneH + laneH / 2;
+
+    const c = document.createElementNS(ns, 'circle');
+    c.setAttribute('class', 'event');
+    c.setAttribute('cx', x.toFixed(2));
+    c.setAttribute('cy', String(y));
+    c.setAttribute('r', '5');
+    const color = e.reinjected ? 'var(--accent2)' :
+                  (e.context_pct >= 70 ? 'var(--danger)' :
+                   e.context_pct >= 50 ? 'var(--warn)' : 'var(--accent)');
+    c.setAttribute('fill', color);
+    c.setAttribute('stroke', 'var(--bg)');
+    c.setAttribute('stroke-width', '1.5');
+
+    c.addEventListener('mouseenter', (ev) => {
+      const date = formatDate(e.happened_at);
+      const pct = e.context_pct != null ? `${e.context_pct}%` : '?';
+      const ri = e.reinjected ? '已 reinject' : '未 reinject';
+      tooltip.textContent = `${date} · context ${pct} · ${ri}`;
+      tooltip.style.display = 'block';
+      const rect = wrap.getBoundingClientRect();
+      tooltip.style.left = (ev.clientX - rect.left + 10) + 'px';
+      tooltip.style.top  = (ev.clientY - rect.top - 30) + 'px';
+    });
+    c.addEventListener('mousemove', (ev) => {
+      const rect = wrap.getBoundingClientRect();
+      tooltip.style.left = (ev.clientX - rect.left + 10) + 'px';
+      tooltip.style.top  = (ev.clientY - rect.top - 30) + 'px';
+    });
+    c.addEventListener('mouseleave', () => {
+      tooltip.style.display = 'none';
+    });
+    svg.appendChild(c);
+  });
+
+  wrap.appendChild(svg);
+  return wrap;
+}
+
+/* ---------------- v3：Diagnostics ---------------- */
+
+async function renderDiagnostics() {
+  const content = document.getElementById('contentPanel');
+  content.innerHTML = '';
+  content.classList.add('full-content');
+
+  const head = document.createElement('div');
+  head.style.display = 'flex';
+  head.style.alignItems = 'center';
+  head.style.justifyContent = 'space-between';
+  head.style.marginBottom = '16px';
+  const h = document.createElement('h2');
+  h.textContent = 'Diagnostics';
+  head.appendChild(h);
+  const runBtn = document.createElement('button');
+  runBtn.className = 'btn-primary';
+  runBtn.textContent = '▶ 執行 analyze（背景）';
+  runBtn.addEventListener('click', async () => {
+    runBtn.disabled = true;
+    runBtn.textContent = '啟動中…';
+    const { status, data } = await fetchJSON('/api/diagnoses/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    if (status === 202 && data.ok) {
+      showToast(`已排入背景執行（pid=${data.job_id}）`, 'success');
+    } else if (status === 503) {
+      showToast('ctx-analyze.py 尚未部署', 'warn');
+    } else {
+      showToast('執行失敗：' + (data.error || '未知錯誤'), 'error');
+    }
+    runBtn.disabled = false;
+    runBtn.textContent = '▶ 執行 analyze（背景）';
+  });
+  head.appendChild(runBtn);
+  content.appendChild(head);
+
+  const data = await fetchAPI('diagnoses', {
+    project_path: currentProjectFilter,
+    limit: 50,
+  });
+  const rows = (data && data.diagnoses) || [];
+  if (!rows.length) {
+    content.appendChild(renderEmptyHint('🩺',
+      '尚無診斷紀錄。點右上執行 analyze'));
+    return;
+  }
+
+  const list = document.createElement('div');
+  list.className = 'diag-list';
+  rows.forEach(r => list.appendChild(renderDiagRow(r)));
+  content.appendChild(list);
+}
+
+function renderDiagRow(r) {
+  const row = document.createElement('div');
+  row.className = 'diag-row';
+  row.dataset.diagId = String(r.id);
+
+  const head = document.createElement('div');
+  head.className = 'diag-row-head';
+  const score = document.createElement('div');
+  score.className = 'dash-score ' + scoreLevel(r.score || 0);
+  score.style.fontSize = '28px';
+  score.textContent = r.score != null ? String(r.score) : '—';
+  head.appendChild(score);
+
+  const info = document.createElement('div');
+  info.style.flex = '1';
+  const t = document.createElement('div');
+  t.style.fontWeight = '600';
+  t.textContent = (r.session_id || '').slice(0, 20) + (r.session_id && r.session_id.length > 20 ? '…' : '');
+  info.appendChild(t);
+  const meta = document.createElement('div');
+  meta.className = 'diag-meta';
+  const pct = r.context_percentage != null ? ` · context ${r.context_percentage}%` : '';
+  meta.textContent = `${formatDate(r.ran_at)}${pct}`;
+  info.appendChild(meta);
+  head.appendChild(info);
+
+  const btnGroup = document.createElement('div');
+  btnGroup.style.display = 'flex';
+  btnGroup.style.gap = '6px';
+  const delBtn = document.createElement('button');
+  delBtn.className = 'btn-action btn-delete';
+  delBtn.innerHTML = '&#128465;';
+  delBtn.title = '刪除';
+  delBtn.dataset.diagId = String(r.id);
+  delBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    deleteDiagnosis(parseInt(e.currentTarget.dataset.diagId, 10));
+  });
+  btnGroup.appendChild(delBtn);
+  head.appendChild(btnGroup);
+  row.appendChild(head);
+
+  const detail = document.createElement('div');
+  detail.className = 'diag-detail';
+  row.appendChild(detail);
+
+  row.addEventListener('click', async () => {
+    if (row.classList.contains('expanded')) {
+      row.classList.remove('expanded');
+      return;
+    }
+    if (!row.dataset.loaded) {
+      const d = await fetchAPI('diagnoses/' + encodeURIComponent(String(r.id)));
+      const full = d && d.data;
+      if (full) {
+        renderDiagDetail(detail, full);
+        row.dataset.loaded = '1';
+      } else {
+        const empty = document.createElement('div');
+        empty.style.color = 'var(--text2)';
+        empty.textContent = '（無法載入 detail）';
+        detail.appendChild(empty);
+      }
+    }
+    row.classList.add('expanded');
+  });
+
+  return row;
+}
+
+function renderDiagDetail(container, full) {
+  container.innerHTML = '';
+  // Token 分類
+  const tokens = document.createElement('div');
+  tokens.style.fontSize = '12px';
+  tokens.style.color = 'var(--text2)';
+  tokens.style.marginBottom = '12px';
+  const parts = TOKEN_CLASSES.map(c =>
+    `${c.label} ${full[c.key] || 0}`).join(' · ');
+  tokens.textContent = parts;
+  container.appendChild(tokens);
+
+  if (full.suggest_focus) {
+    const box = document.createElement('div');
+    box.style.padding = '8px 10px';
+    box.style.background = 'var(--bg)';
+    box.style.border = '1px solid var(--border)';
+    box.style.borderRadius = '4px';
+    box.style.marginBottom = '12px';
+    box.style.fontFamily = "'SF Mono', Monaco, Consolas, monospace";
+    box.style.fontSize = '12px';
+    box.textContent = '/compact focus on ' + full.suggest_focus;
+    container.appendChild(box);
+  }
+
+  const findings = full.findings || [];
+  if (!findings.length) {
+    const empty = document.createElement('div');
+    empty.style.color = 'var(--text2)';
+    empty.style.fontSize = '13px';
+    empty.textContent = '無 findings';
+    container.appendChild(empty);
+    return;
+  }
+  const list = document.createElement('div');
+  list.className = 'findings-list';
+  findings.forEach(f => list.appendChild(renderFindingItem(f)));
+  container.appendChild(list);
+}
+
+async function deleteDiagnosis(id) {
+  if (!Number.isInteger(id)) return;
+  if (!confirm('確定刪除此筆診斷？')) return;
+  const { status, data } = await fetchJSON(
+    '/api/diagnoses/' + id, { method: 'DELETE' });
+  if (status === 200 && data.ok) {
+    showToast('已刪除', 'success');
+    renderDiagnostics();
+  } else if (status === 404) {
+    showToast('紀錄不存在', 'error');
+  } else {
+    showToast('刪除失敗：' + (data.error || '未知錯誤'), 'error');
+  }
+}
+
+/* ---------------- v3：Persistent ---------------- */
+
+async function renderPersistent() {
+  const content = document.getElementById('contentPanel');
+  content.innerHTML = '';
+  content.classList.add('full-content');
+
+  const head = document.createElement('h2');
+  head.style.marginBottom = '16px';
+  head.textContent = 'Persistent（長效筆記）';
+  content.appendChild(head);
+
+  const data = await fetchAPI('persistent', {
+    project_path: currentProjectFilter,
+  });
+  const rows = (data && data.persistent) || [];
+  if (!rows.length) {
+    content.appendChild(renderEmptyHint('🔒',
+      '尚無長效筆記。使用 /ctx-save --persistent 或在 Saves tab pin 記錄'));
+    return;
+  }
+
+  const list = document.createElement('div');
+  list.className = 'pin-list';
+  rows.forEach(r => list.appendChild(renderPinCard(r)));
+  content.appendChild(list);
+}
+
+function renderPinCard(r) {
+  const card = document.createElement('div');
+  card.className = 'pin-card';
+  card.dataset.saveId = String(r.id);
+
+  const head = document.createElement('div');
+  head.className = 'pin-card-head';
+  const lock = document.createElement('span');
+  lock.textContent = '🔒';
+  head.appendChild(lock);
+  const title = document.createElement('div');
+  title.className = 'pin-card-title';
+  title.textContent = r.title || '(無標題)';
+  head.appendChild(title);
+  card.appendChild(head);
+
+  const meta = document.createElement('div');
+  meta.className = 'pin-card-meta';
+  const parts = [
+    formatDate(r.created_at),
+    r.category || '',
+    r.project_path ? '📁 ' + homeRelative(r.project_path) : '',
+  ].filter(Boolean);
+  meta.textContent = parts.join(' · ');
+  card.appendChild(meta);
+
+  const body = document.createElement('div');
+  body.className = 'pin-card-body';
+  body.textContent = (r.content || '').slice(0, 800);
+  card.appendChild(body);
+
+  const actions = document.createElement('div');
+  actions.className = 'pin-card-actions';
+
+  const unpin = document.createElement('button');
+  unpin.className = 'btn-action';
+  unpin.textContent = '🔓 取消釘選';
+  unpin.dataset.saveId = String(r.id);
+  unpin.addEventListener('click', async (e) => {
+    const id = parseInt(e.currentTarget.dataset.saveId, 10);
+    await togglePin(id, false);
+    renderPersistent();
+  });
+  actions.appendChild(unpin);
+
+  const copy = document.createElement('button');
+  copy.className = 'btn-action';
+  copy.innerHTML = '&#128203; 複製 MD';
+  copy.addEventListener('click', async () => {
+    const md = [
+      '---',
+      'title: ' + (r.title || ''),
+      'category: ' + (r.category || ''),
+      'tags: ' + (r.tags || ''),
+      'project_path: ' + (r.project_path || ''),
+      'created_at: ' + (r.created_at || ''),
+      'is_persistent: true',
+      '---',
+      '',
+      r.content || '',
+    ].join('\n');
+    const ok = await copyToClipboard(md);
+    showToast(ok ? '已複製 Markdown' : '複製失敗', ok ? 'success' : 'error');
+  });
+  actions.appendChild(copy);
+  card.appendChild(actions);
+
+  return card;
+}
+
+async function togglePin(saveId, pinned) {
+  const { status, data } = await fetchJSON(
+    '/api/saves/' + saveId + '/pin', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pinned: !!pinned }),
+    }
+  );
+  if (status === 200 && data.ok) {
+    showToast(pinned ? '已釘選' : '已取消釘選', 'success');
+    return true;
+  }
+  if (status === 503) {
+    showToast('is_persistent 欄位尚未 migrate', 'warn');
+  } else {
+    showToast('操作失敗：' + (data.error || '未知錯誤'), 'error');
+  }
+  return false;
+}
+
+async function triggerDistill(saveId) {
+  const { status, data } = await fetchJSON(
+    '/api/saves/' + saveId + '/distill', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }
+  );
+  if (status === 202 && data.ok) {
+    showToast(`已排入 distill（pid=${data.job_id}）`, 'success');
+  } else if (status === 503) {
+    showToast('ctx-distill.py 尚未部署', 'warn');
+  } else {
+    showToast('操作失敗：' + (data.error || '未知錯誤'), 'error');
   }
 }
 
@@ -1345,11 +2302,15 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
 
+  // Hash router
+  window.addEventListener('hashchange', handleHashRoute);
+
   // 啟動流程
   (async () => {
     await updateHeader();
     await loadProjects();
     await loadSessions();
+    handleHashRoute();
   })();
 });
 </script>
@@ -1532,6 +2493,23 @@ class RequestHandler(BaseHTTPRequestHandler):
                 session_id = path.split("/api/session/", 1)[1]
                 self._handle_session_detail(session_id)
                 return
+            # -- v3 新增 endpoints --
+            if path == "/api/diagnoses":
+                self._handle_diagnoses_list(params)
+                return
+            if path.startswith("/api/diagnoses/"):
+                id_str = path.split("/api/diagnoses/", 1)[1]
+                self._handle_diagnosis_detail(id_str)
+                return
+            if path == "/api/persistent":
+                self._handle_persistent_list(params)
+                return
+            if path == "/api/compact-events":
+                self._handle_compact_events(params)
+                return
+            if path == "/api/dashboard/health":
+                self._handle_dashboard_health(params)
+                return
             self._not_found()
         except sqlite3.OperationalError as e:
             self._wrap_operational_error(e)
@@ -1551,6 +2529,25 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return
                 self._handle_batch_delete()
                 return
+            # -- v3 新增 POST endpoints --
+            if path == "/api/diagnoses/run":
+                if self._reject_cross_origin():
+                    return
+                self._handle_diagnoses_run()
+                return
+            # /api/saves/:id/distill 與 /api/saves/:id/pin
+            m = re.match(r"^/api/saves/(\d+)/distill$", path)
+            if m:
+                if self._reject_cross_origin():
+                    return
+                self._handle_save_distill(int(m.group(1)))
+                return
+            m = re.match(r"^/api/saves/(\d+)/pin$", path)
+            if m:
+                if self._reject_cross_origin():
+                    return
+                self._handle_save_pin(int(m.group(1)))
+                return
             self._not_found()
         except sqlite3.OperationalError as e:
             self._wrap_operational_error(e)
@@ -1568,6 +2565,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             if self._reject_cross_origin():
                 return
 
+            # 必須先匹配更具體的 /api/saves/:id/xxx 子路徑（目前無 DELETE 子路徑，留以待擴）
             if path.startswith("/api/saves/"):
                 id_str = path.split("/api/saves/", 1)[1]
                 self._handle_delete_save(id_str)
@@ -1575,6 +2573,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             if path.startswith("/api/session/"):
                 session_id = path.split("/api/session/", 1)[1]
                 self._handle_delete_session(session_id)
+                return
+            if path.startswith("/api/diagnoses/"):
+                id_str = path.split("/api/diagnoses/", 1)[1]
+                self._handle_delete_diagnosis(id_str)
                 return
             self._not_found()
         except sqlite3.OperationalError as e:
@@ -2013,6 +3015,529 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "batches": batches,
                     "mode": mode,
                 }
+
+    # ============================== v3 handlers ==============================
+
+    # ---- Diagnoses ----
+
+    def _handle_diagnoses_list(self, params):
+        """GET /api/diagnoses — 列出診斷紀錄（不含 findings_json 以減輕 payload）"""
+        session_id = (params.get("session_id", [""])[0] or "").strip() or None
+        project_path = (params.get("project_path", [""])[0] or "").strip() or None
+        limit_raw = params.get("limit", ["50"])[0]
+        try:
+            limit = int(limit_raw)
+        except ValueError:
+            self._json_response(400, {"ok": False, "error": "invalid limit"})
+            return
+        if limit < 1 or limit > 200:
+            self._json_response(400, {"ok": False, "error": "invalid limit"})
+            return
+
+        rows = self._query_diagnoses_list(session_id, project_path, limit)
+        self._json_response(200, {"diagnoses": rows})
+
+    def _query_diagnoses_list(self, session_id, project_path, limit):
+        """優先走 Facade；若 Facade 尚未實作則 fallback 自查 schema。"""
+        fn = getattr(CTX_DB, "list_diagnoses", None)
+        if callable(fn):
+            try:
+                rows = fn(DB_PATH, session_id=session_id,
+                          project_path=project_path, limit=limit)
+                return rows or []
+            except TypeError:
+                # 簽名不同時退回 fallback
+                pass
+        return self._fallback_list_diagnoses(session_id, project_path, limit)
+
+    def _fallback_list_diagnoses(self, session_id, project_path, limit):
+        if not self._has_table_safe("context_diagnoses"):
+            return []
+        where = ["deleted_at IS NULL"]
+        args = []
+        if session_id:
+            where.append("session_id = ?")
+            args.append(session_id)
+        if project_path:
+            where.append("project_path = ?")
+            args.append(project_path)
+        where_sql = " AND ".join(where)
+        with self.get_db() as conn:
+            rows = conn.execute(f"""
+                SELECT id, session_id, project_path, ran_at, score,
+                       context_percentage, suggest_focus
+                FROM context_diagnoses
+                WHERE {where_sql}
+                ORDER BY ran_at DESC
+                LIMIT ?
+            """, (*args, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def _handle_diagnosis_detail(self, id_str):
+        """GET /api/diagnoses/:id — 含 findings 展開"""
+        try:
+            diag_id = int(id_str)
+        except ValueError:
+            self._json_response(400, {"ok": False, "error": "invalid id"})
+            return
+
+        row = self._query_diagnosis_detail(diag_id)
+        if row is None:
+            # 依規範：find_* 回 None 時回 {data: null} 而非 404
+            self._json_response(200, {"data": None})
+            return
+        self._json_response(200, {"data": row})
+
+    def _query_diagnosis_detail(self, diag_id):
+        fn = getattr(CTX_DB, "get_diagnosis", None)
+        if callable(fn):
+            try:
+                row = fn(DB_PATH, diag_id)
+                return self._expand_findings(row) if row else None
+            except TypeError:
+                pass
+        if not self._has_table_safe("context_diagnoses"):
+            return None
+        with self.get_db() as conn:
+            r = conn.execute("""
+                SELECT id, session_id, project_path, ran_at, score,
+                       context_percentage,
+                       tokens_conversation, tokens_files, tokens_tools_schema,
+                       tokens_tools_runtime, tokens_system,
+                       findings_json, suggest_focus
+                FROM context_diagnoses
+                WHERE id = ? AND deleted_at IS NULL
+            """, (diag_id,)).fetchone()
+        return self._expand_findings(dict(r)) if r else None
+
+    def _expand_findings(self, row):
+        """把 findings_json 欄位 loads 成 findings list。
+
+        ctx-db Facade 的 get_diagnosis 已直接回 findings list；
+        此函式相容 fallback SQL（回 findings_json 原文）情境。
+        """
+        if not row:
+            return row
+        existing = row.get("findings")
+        if isinstance(existing, list):
+            # Facade 已展開；原樣保留
+            return row
+        raw = row.pop("findings_json", None)
+        findings = []
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    findings = parsed
+                elif isinstance(parsed, dict) and isinstance(parsed.get("findings"), list):
+                    findings = parsed["findings"]
+            except (TypeError, ValueError):
+                findings = []
+        row["findings"] = findings
+        return row
+
+    def _handle_delete_diagnosis(self, id_str):
+        """DELETE /api/diagnoses/:id — 軟刪除"""
+        try:
+            diag_id = int(id_str)
+        except ValueError:
+            self._json_response(400, {"ok": False, "error": "invalid id"})
+            return
+
+        fn = getattr(CTX_DB, "delete_diagnosis", None)
+        try:
+            if callable(fn):
+                try:
+                    fn(DB_PATH, diag_id)
+                    self._json_response(200, {"ok": True, "id": diag_id, "mode": "facade"})
+                    return
+                except TypeError:
+                    pass
+            if not self._has_table_safe("context_diagnoses"):
+                self._json_response(404, {"ok": False, "error": "no diagnoses table"})
+                return
+            with self.get_db(writer=True) as conn:
+                cur = conn.execute(
+                    "UPDATE context_diagnoses SET deleted_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ? AND deleted_at IS NULL",
+                    (diag_id,),
+                )
+                affected = cur.rowcount
+                conn.commit()
+            if affected == 0:
+                self._json_response(404, {"ok": False, "error": "diagnosis not found"})
+                return
+            self._json_response(200, {"ok": True, "id": diag_id, "mode": "soft"})
+        except sqlite3.OperationalError as e:
+            self._wrap_operational_error(e)
+
+    # ---- Persistent ----
+
+    def _handle_persistent_list(self, params):
+        """GET /api/persistent — is_persistent=1 的筆記"""
+        project_path = (params.get("project_path", [""])[0] or "").strip() or None
+
+        fn = getattr(CTX_DB, "list_persistent", None)
+        if callable(fn):
+            try:
+                rows = fn(DB_PATH, project_path=project_path) or []
+                self._json_response(200, {"persistent": rows})
+                return
+            except TypeError:
+                pass
+
+        # Fallback：schema 已包含 is_persistent 欄位
+        if not self._has_column_safe("context_saves", "is_persistent"):
+            self._json_response(200, {"persistent": []})
+            return
+        where = ["is_persistent = 1", "deleted_at IS NULL"]
+        args = []
+        if project_path:
+            where.append("project_path = ?")
+            args.append(project_path)
+        where_sql = " AND ".join(where)
+        with self.get_db() as conn:
+            rows = conn.execute(f"""
+                SELECT id, session_id, project_path, created_at, category, title,
+                       content, tags, context_percentage, model,
+                       is_persistent, restored_at
+                FROM context_saves
+                WHERE {where_sql}
+                ORDER BY created_at DESC
+                LIMIT 500
+            """, args).fetchall()
+        self._json_response(200, {"persistent": [dict(r) for r in rows]})
+
+    # ---- Compact events ----
+
+    def _handle_compact_events(self, params):
+        """GET /api/compact-events — 近 30 天 compact 事件"""
+        session_id = (params.get("session_id", [""])[0] or "").strip() or None
+        project_path = (params.get("project_path", [""])[0] or "").strip() or None
+        try:
+            days = int(params.get("days", ["30"])[0])
+        except ValueError:
+            days = 30
+        if days < 1 or days > 365:
+            days = 30
+
+        events = self._query_compact_events(session_id, project_path, days)
+        self._json_response(200, {
+            "events": events,
+            "days": days,
+            "source": self._compact_events_source(),
+        })
+
+    def _compact_events_source(self):
+        """回報資料來源：compact_events 表 or fallback"""
+        if self._has_table_safe("context_compact_events"):
+            return "context_compact_events"
+        return "context_saves_autodump"
+
+    def _query_compact_events(self, session_id, project_path, days):
+        fn = getattr(CTX_DB, "list_compact_events", None)
+        if callable(fn):
+            try:
+                rows = fn(DB_PATH, session_id=session_id, days=days) or []
+                # Facade 不支援 project 過濾時前端自行過濾
+                if project_path:
+                    rows = [r for r in rows if r.get("project_path") == project_path]
+                return rows
+            except TypeError:
+                pass
+
+        if self._has_table_safe("context_compact_events"):
+            where = ["deleted_at IS NULL",
+                     "happened_at >= datetime('now', ?)"]
+            args = [f"-{days} days"]
+            if session_id:
+                where.append("session_id = ?")
+                args.append(session_id)
+            if project_path:
+                where.append("project_path = ?")
+                args.append(project_path)
+            where_sql = " AND ".join(where)
+            with self.get_db() as conn:
+                rows = conn.execute(f"""
+                    SELECT id, session_id, project_path, happened_at, trigger,
+                           context_pct, snapshot_id, reinjected
+                    FROM context_compact_events
+                    WHERE {where_sql}
+                    ORDER BY happened_at DESC
+                    LIMIT 1000
+                """, args).fetchall()
+            return [dict(r) for r in rows]
+
+        # Fallback：查 context_saves WHERE category='auto-dump'
+        where = ["deleted_at IS NULL",
+                 "category = 'auto-dump'",
+                 "created_at >= datetime('now', ?)"]
+        args = [f"-{days} days"]
+        if session_id:
+            where.append("session_id = ?")
+            args.append(session_id)
+        if project_path:
+            where.append("project_path = ?")
+            args.append(project_path)
+        where_sql = " AND ".join(where)
+        # restored_at 欄位 v3 才有，舊 schema 可能沒有
+        has_restored = self._has_column_safe("context_saves", "restored_at")
+        restored_expr = "restored_at" if has_restored else "NULL"
+        with self.get_db() as conn:
+            rows = conn.execute(f"""
+                SELECT id AS snapshot_id, session_id, project_path,
+                       created_at AS happened_at,
+                       'auto' AS trigger,
+                       context_percentage AS context_pct,
+                       {restored_expr} AS restored_at
+                FROM context_saves
+                WHERE {where_sql}
+                ORDER BY created_at DESC
+                LIMIT 1000
+            """, args).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["id"] = d.get("snapshot_id")
+            d["reinjected"] = 1 if d.get("restored_at") else 0
+            result.append(d)
+        return result
+
+    # ---- Dashboard ----
+
+    def _handle_dashboard_health(self, params):
+        """GET /api/dashboard/health — 最新診斷 + 近 30 天統計"""
+        project_path = (params.get("project_path", [""])[0] or "").strip() or None
+
+        latest = self._query_latest_diagnosis(project_path)
+        saves_stats = self._query_saves_recent_stats(project_path, days=30)
+
+        self._json_response(200, {
+            "latest_diagnosis": latest,   # 可能為 None → 前端 empty state
+            "saves_stats": saves_stats,
+        })
+
+    def _query_latest_diagnosis(self, project_path):
+        fn = getattr(CTX_DB, "list_diagnoses", None)
+        rows = []
+        if callable(fn):
+            try:
+                rows = fn(DB_PATH, project_path=project_path, limit=1) or []
+            except TypeError:
+                rows = []
+        if rows:
+            first = rows[0]
+            # 若 Facade 沒回 findings_json，用 detail 查一次
+            if "findings" not in first:
+                detail = self._query_diagnosis_detail(first.get("id"))
+                return detail or first
+            return first
+        # Fallback
+        rows = self._fallback_list_diagnoses(None, project_path, 1)
+        if not rows:
+            return None
+        return self._query_diagnosis_detail(rows[0]["id"])
+
+    def _query_saves_recent_stats(self, project_path, days=30):
+        """近 N 天 context_saves 統計：總數、by_category、近期 auto-dump 間隔"""
+        where = ["deleted_at IS NULL",
+                 "created_at >= datetime('now', ?)"]
+        args = [f"-{days} days"]
+        if project_path:
+            where.append("project_path = ?")
+            args.append(project_path)
+        where_sql = " AND ".join(where)
+        with self.get_db() as conn:
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM context_saves WHERE {where_sql}",
+                args,
+            ).fetchone()[0]
+            by_category = dict(conn.execute(f"""
+                SELECT category, COUNT(*) FROM context_saves
+                WHERE {where_sql}
+                GROUP BY category
+                ORDER BY COUNT(*) DESC
+            """, args).fetchall())
+            autodump_total = conn.execute(f"""
+                SELECT COUNT(*) FROM context_saves
+                WHERE {where_sql} AND category = 'auto-dump'
+            """, args).fetchone()[0]
+            # 上一個月同長度區間的 auto-dump 次數（供 MoM 對比）
+            prev_args = [f"-{days * 2} days", f"-{days} days"]
+            prev_where = ["deleted_at IS NULL",
+                          "category = 'auto-dump'",
+                          "created_at >= datetime('now', ?)",
+                          "created_at <  datetime('now', ?)"]
+            if project_path:
+                prev_where.append("project_path = ?")
+                prev_args.append(project_path)
+            prev_where_sql = " AND ".join(prev_where)
+            prev_autodump = conn.execute(
+                f"SELECT COUNT(*) FROM context_saves WHERE {prev_where_sql}",
+                prev_args,
+            ).fetchone()[0]
+        return {
+            "days": days,
+            "total": total,
+            "by_category": by_category,
+            "autodump_total": autodump_total,
+            "autodump_prev_period": prev_autodump,
+        }
+
+    # ---- POST: diagnoses run / distill / pin ----
+
+    def _handle_diagnoses_run(self):
+        """POST /api/diagnoses/run — 背景觸發 ctx-analyze.py"""
+        body = self._read_json_body()
+        if body is None:
+            return
+        session_id = body.get("session_id")
+        if session_id is not None:
+            if not isinstance(session_id, str) or len(session_id) > 256:
+                self._json_response(400, {"ok": False, "error": "invalid session_id"})
+                return
+            if session_id and not CTX_DB._validate_session_id(session_id):
+                self._json_response(400, {"ok": False, "error": "invalid session_id"})
+                return
+
+        script = Path(__file__).resolve().parent / "ctx-analyze.py"
+        if not script.exists():
+            self._json_response(503, {
+                "ok": False,
+                "error": "ctx-analyze.py not available",
+            })
+            return
+
+        # DB 路徑透過 env 傳遞（ctx-analyze.py 讀 CTX_SAVE_DB_PATH，不認 --db 旗標）
+        cmd = [sys.executable, str(script)]
+        if session_id:
+            cmd += ["--session", session_id]
+        job_id = self._spawn_background(
+            cmd,
+            label="ctx-analyze",
+            env={"CTX_SAVE_DB_PATH": str(DB_PATH)},
+        )
+        if job_id is None:
+            self._json_response(500, {"ok": False, "error": "failed to spawn analyze"})
+            return
+        self._json_response(202, {
+            "ok": True,
+            "status": "queued",
+            "job_id": job_id,
+            "cmd": "ctx-analyze.py",
+        })
+
+    def _handle_save_distill(self, save_id):
+        """POST /api/saves/:id/distill — 背景觸發 ctx-distill.py"""
+        script = Path(__file__).resolve().parent / "ctx-distill.py"
+        if not script.exists():
+            self._json_response(503, {
+                "ok": False,
+                "error": "ctx-distill.py not available",
+            })
+            return
+        # ctx-distill.py 接位置參數 save_id；DB 路徑走 env（無 --db / --source-id 旗標）
+        cmd = [sys.executable, str(script), str(save_id)]
+        job_id = self._spawn_background(
+            cmd,
+            label="ctx-distill",
+            env={"CTX_SAVE_DB_PATH": str(DB_PATH)},
+        )
+        if job_id is None:
+            self._json_response(500, {"ok": False, "error": "failed to spawn distill"})
+            return
+        self._json_response(202, {
+            "ok": True,
+            "status": "queued",
+            "job_id": job_id,
+            "source_id": save_id,
+        })
+
+    def _handle_save_pin(self, save_id):
+        """POST /api/saves/:id/pin — 切 is_persistent=1/0"""
+        body = self._read_json_body()
+        if body is None:
+            return
+        pinned = bool(body.get("pinned", True))
+
+        fn = getattr(CTX_DB, "pin_save", None)
+        try:
+            if callable(fn):
+                try:
+                    fn(DB_PATH, save_id, pinned)
+                    self._json_response(200, {
+                        "ok": True, "id": save_id, "pinned": pinned, "mode": "facade",
+                    })
+                    return
+                except TypeError:
+                    pass
+            # Fallback
+            if not self._has_column_safe("context_saves", "is_persistent"):
+                self._json_response(503, {
+                    "ok": False, "error": "is_persistent column not migrated",
+                })
+                return
+            with self.get_db(writer=True) as conn:
+                cur = conn.execute(
+                    "UPDATE context_saves SET is_persistent = ? "
+                    "WHERE id = ? AND deleted_at IS NULL",
+                    (1 if pinned else 0, save_id),
+                )
+                affected = cur.rowcount
+                conn.commit()
+            if affected == 0:
+                self._json_response(404, {"ok": False, "error": "record not found"})
+                return
+            self._json_response(200, {
+                "ok": True, "id": save_id, "pinned": pinned, "mode": "direct",
+            })
+        except sqlite3.OperationalError as e:
+            self._wrap_operational_error(e)
+
+    # ---- 內部工具 ----
+
+    def _spawn_background(self, cmd, label="job", env=None):
+        """背景啟動子程序並把 stdout/stderr 轉到 DEVNULL，立刻回 PID。
+
+        env 若提供，會合併到 os.environ 後傳給子程序，避免覆蓋整個環境。
+        回傳 pid（int）或 None。
+        """
+        merged_env = None
+        if env is not None:
+            merged_env = {**os.environ, **env}
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+                env=merged_env,
+            )
+            logger.info("spawned %s pid=%d cmd=%s", label, proc.pid, " ".join(cmd))
+            return proc.pid
+        except (OSError, ValueError) as e:
+            logger.error("spawn %s failed: %s", label, e)
+            return None
+
+    def _has_table_safe(self, table):
+        try:
+            with self.get_db() as conn:
+                return CTX_DB._has_table(conn, table)
+        except sqlite3.OperationalError:
+            return False
+        except Exception:
+            return False
+
+    def _has_column_safe(self, table, column):
+        try:
+            with self.get_db() as conn:
+                return CTX_DB._has_column(conn, table, column)
+        except sqlite3.OperationalError:
+            return False
+        except Exception:
+            return False
 
 
 # --------------------------------------------------------------------------

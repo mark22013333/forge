@@ -8,7 +8,9 @@
       "auto_dump_threshold": 70,      // auto 模式下觸發自動 raw dump 的百分比
       "cooldown_minutes": 15,         // 兩次提醒/dump 間的冷卻
       "dump_strategy": "raw_all",     // 保留全部 raw 對話（未來可擴 summary）
-      "transcript_tail_kb": 200       // auto-dump 讀 transcript 尾端的 KB 數
+      "transcript_tail_kb": 200,      // auto-dump 讀 transcript 尾端的 KB 數
+      "restore_strategy": "summary",  // v3：reinject 策略 off/summary/full/ask
+      "max_reinject_bytes": 4096      // v3：reinject 單次注入上限（bytes）
     }
 
 用法:
@@ -35,9 +37,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "cooldown_minutes": 15,
     "dump_strategy": "raw_all",
     "transcript_tail_kb": 200,
+    # v3 新增：compact 後自動還原閉環
+    "restore_strategy": "summary",
+    "max_reinject_bytes": 4096,
 }
 
 VALID_MODES = {"off", "assist", "auto"}
+VALID_RESTORE_STRATEGIES = {"off", "summary", "full", "ask"}
 
 
 def config_path() -> Path:
@@ -83,6 +89,7 @@ def coerce(key: str, raw: str) -> Any:
         "auto_dump_threshold",
         "cooldown_minutes",
         "transcript_tail_kb",
+        "max_reinject_bytes",
     ):
         try:
             value = int(raw)
@@ -94,10 +101,19 @@ def coerce(key: str, raw: str) -> Any:
             raise ValueError("cooldown_minutes must be >= 0")
         if key == "transcript_tail_kb" and value < 1:
             raise ValueError("transcript_tail_kb must be >= 1")
+        if key == "max_reinject_bytes" and value < 256:
+            raise ValueError("max_reinject_bytes must be >= 256")
         return value
     if key == "dump_strategy":
         if raw not in {"raw_all"}:
             raise ValueError("dump_strategy must be: raw_all")
+        return raw
+    if key == "restore_strategy":
+        if raw not in VALID_RESTORE_STRATEGIES:
+            raise ValueError(
+                "restore_strategy must be one of: "
+                + ", ".join(sorted(VALID_RESTORE_STRATEGIES))
+            )
         return raw
     raise ValueError(f"unknown key: {key}")
 
