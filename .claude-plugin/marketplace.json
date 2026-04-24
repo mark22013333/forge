@@ -19,7 +19,7 @@
     {
       "name": "ctx-save",
       "description": "Context Save — 在 Claude Code 自動壓縮前保存對話重點。支援 Markdown 與 SQLite 儲存，搭配 Hook 自動提醒。",
-      "version": "2.3.1",
+      "version": "3.0.0",
       "author": {
         "name": "Cheng"
       },
