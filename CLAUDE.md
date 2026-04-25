@@ -38,3 +38,8 @@ Key routing rules:
 - Review what gstack has learned → invoke /learn
 - Tune question sensitivity → invoke /plan-tune
 - Code quality dashboard → invoke /health
+
+## Health Stack
+
+- test: python3 -m pytest plugins/ctx-save/skills/ctx-save/scripts/tests/
+- shell: bash -n plugins/ctx-save/skills/ctx-save/scripts/ctx-alert.sh
