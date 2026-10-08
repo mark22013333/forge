@@ -1,0 +1,57 @@
+// ci-init.gradle — CI 專用的 Gradle init script
+//
+// 用法：gradle test --init-script <路徑>/ci-init.gradle
+// 不修改專案的 build.gradle；只在 CI 載入。
+//
+// 做的事：
+//   1. 所有 Test 任務 failFast = false：一個測試失敗不會讓後面全部停跑（踩坑 10）
+//   2. 所有 Test 任務 forkEvery = 1：每個測試類別獨立 JVM，避免共用靜態狀態互相污染（踩坑 11）
+//   3. 環境變數 RECENT_TESTS_FILE 有值時，只跑清單內的測試；清單為空直接失敗（踩坑 12）
+//   4. EXCLUDED_TESTS 內的測試一律排除，每筆都要寫原因與移除條件
+//
+// 為什麼全部寫在 gradle.projectsEvaluated 裡：
+//   build.gradle 的 test { failFast = true } 在專案評估時才套用，init script 若在更早的時點設定，
+//   會被它蓋回去。已用最小專案（Gradle 8.14.3）證實：寫在外層時 failFast 仍為 true，寫在 projectsEvaluated 內才是 false。
+
+// 暫時排除的測試：格式為 [測試類別或樣式, 原因, 何時移除]
+// 範例（請換成你的專案實際狀況，不要留著範例）：
+//   ['com.example.cache.SomeCacheDependentTest',
+//    '依賴其他測試先初始化快取叢集，獨立 JVM 下會 NPE（本機單獨執行也重現）',
+//    '測試自行初始化所需元件後移除']
+def EXCLUDED_TESTS = [
+]
+
+gradle.projectsEvaluated {
+    def recentFile = System.getenv('RECENT_TESTS_FILE')
+    def recentTests = null
+    if (recentFile) {
+        def f = new File(recentFile)
+        if (!f.isFile()) {
+            throw new GradleException("RECENT_TESTS_FILE 指向的檔案不存在：${recentFile}")
+        }
+        recentTests = f.readLines('UTF-8')
+                // 去掉 BOM：Windows PowerShell 5 的 Set-Content -Encoding UTF8 會寫入 BOM，第一行會對不上
+                .collect { it.replace('\uFEFF', '').trim() }
+                .findAll { it && !it.startsWith('#') }
+        if (recentTests.isEmpty()) {
+            // 清單為空時若照常執行，會變成「零測試、建置通過」的假綠燈
+            throw new GradleException("RECENT_TESTS_FILE 清單為空（${recentFile}），拒絕以零測試通過建置")
+        }
+        println "ci-init: 只執行近期修改的 ${recentTests.size()} 個測試"
+    }
+
+    gradle.rootProject.allprojects { p ->
+        p.tasks.withType(Test).configureEach { t ->
+            t.failFast = false
+            t.forkEvery = 1
+            if (recentTests != null) {
+                recentTests.each { t.filter.includeTestsMatching(it) }
+                // 多子專案時，清單中的類別只會存在於其中幾個子專案；其餘子專案找不到符合的測試屬正常，
+                // 不應因此失敗。代價：若清單內容全部對不上任何測試，建置不會失敗，
+                // 必須以測試統計（REST API 或測試結果頁）確認實際執行數 > 0。
+                t.filter.failOnNoMatchingTests = false
+            }
+            EXCLUDED_TESTS.each { entry -> t.filter.excludeTestsMatching(entry[0]) }
+        }
+    }
+}

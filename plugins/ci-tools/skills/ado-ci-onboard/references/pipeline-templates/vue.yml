@@ -1,0 +1,55 @@
+# Azure Pipelines 範本：Vue（Node.js）前端（Windows 自架 agent）
+#
+# 驗證狀態：未驗證。這份範本沒有在任何 ADO 環境實際跑過。
+#           其中 NPM_CONFIG_CACHE 的設定來自踩坑 7（已遇到），其餘步驟為類推。
+#           第一次套用時，請照 SKILL.md 第 5 章用 REST API 逐項確認，並把結果回寫到這段標示。
+#
+# 套用前要做的事：
+#   1. 確認 package.json 有 test:unit 與 build 兩個 script，且單元測試能輸出 JUnit XML
+#      （例：Vitest 加 --reporter=junit --outputFile=reports/junit.xml）
+#   2. agent 要有 capability 標籤 node
+
+trigger:
+  branches:
+    include:
+    - main
+    - uat
+
+parameters:
+- name: npmCache
+  displayName: npm 快取路徑（agent 帳戶要能寫入）
+  type: string
+  default: 'D:\ci-cache\npm'
+
+pool:
+  name: Default
+  demands:
+  - node
+
+steps:
+- checkout: self
+
+# NetworkService 沒有使用者資料夾，npm 快取預設落在 C:\Users\Default 會 EPERM（踩坑 7）
+- script: npm ci
+  displayName: 安裝依賴
+  env:
+    NPM_CONFIG_CACHE: ${{ parameters.npmCache }}
+
+- script: npm run test:unit -- --reporter=junit --outputFile=reports/junit.xml
+  displayName: 單元測試
+  env:
+    NPM_CONFIG_CACHE: ${{ parameters.npmCache }}
+    CI: 'true'
+
+- script: npm run build
+  displayName: 建置
+  env:
+    NPM_CONFIG_CACHE: ${{ parameters.npmCache }}
+
+- task: PublishTestResults@2
+  displayName: 發佈測試結果
+  condition: succeededOrFailed()
+  inputs:
+    testResultsFormat: JUnit
+    testResultsFiles: 'reports/junit.xml'
+    failTaskOnFailedTests: false

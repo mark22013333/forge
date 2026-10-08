@@ -1,0 +1,66 @@
+# Azure Pipelines 範本：Maven ＋ JDK 25（Windows 自架 agent）
+#
+# 驗證狀態：未驗證。這份範本沒有在任何 ADO 環境實際跑過，只依 gradle17.yml 的已知踩坑類推。
+#           第一次套用時，請照 SKILL.md 第 5 章用 REST API 逐項確認，並把結果回寫到這段標示。
+#
+# 套用前要做的事：
+#   1. 把 <...> 佔位符換成專案的值；實際值記在專案自己的 .ci-tools.yml
+#   2. agent 要有 capability 標籤 JDK25
+#   3. 確認專案使用的 Maven 與外掛版本支援 JDK 25
+
+trigger:
+  branches:
+    include:
+    - main
+    - uat
+
+parameters:
+- name: offline
+  displayName: 離線建置（-o）
+  type: boolean
+  default: true
+- name: jdkHome
+  displayName: JDK 25 路徑
+  type: string
+  default: 'C:\Java\jdk-25'
+- name: mavenRepoLocal
+  displayName: Maven 本機套件庫路徑（agent 帳戶要能寫入）
+  type: string
+  default: 'D:\ci-cache\m2'
+
+pool:
+  name: Default
+  demands:
+  - JDK25
+
+variables:
+- name: JAVA_HOME
+  value: ${{ parameters.jdkHome }}
+- ${{ if eq(parameters.offline, true) }}:
+  - name: offlineFlag
+    value: '-o'
+- ${{ if ne(parameters.offline, true) }}:
+  - name: offlineFlag
+    value: ''
+
+steps:
+- checkout: self
+  fetchDepth: 0
+
+# [推測] 與 maven8.yml 相同：明確指定 -Dmaven.repo.local，不依賴 agent 帳戶的使用者資料夾
+- script: >
+    mvn -B $(offlineFlag) clean verify
+    "-Dmaven.repo.local=${{ parameters.mavenRepoLocal }}"
+    -Dsurefire.useFile=false
+  displayName: Maven 建置與測試
+  env:
+    JAVA_HOME: $(JAVA_HOME)
+    MAVEN_OPTS: -Xmx3g
+
+- task: PublishTestResults@2
+  displayName: 發佈測試結果
+  condition: succeededOrFailed()
+  inputs:
+    testResultsFormat: JUnit
+    testResultsFiles: '**/target/surefire-reports/TEST-*.xml'
+    failTaskOnFailedTests: false
