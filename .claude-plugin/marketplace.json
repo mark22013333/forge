@@ -17,16 +17,6 @@
       "category": "productivity"
     },
     {
-      "name": "ctx-save",
-      "description": "Context Save — 在 Claude Code 自動壓縮前保存對話重點。支援 Markdown 與 SQLite 儲存，搭配 Hook 自動提醒。",
-      "version": "3.0.0",
-      "author": {
-        "name": "Cheng"
-      },
-      "source": "./plugins/ctx-save",
-      "category": "productivity"
-    },
-    {
       "name": "ci-tools",
       "description": "CI 導入工具集 — 引導自架 Azure DevOps Server 接上既有 Gitea 專案的 CI：評估與安裝、pipeline 範本、測試隔離 init script、Gitea → ADO 單向快轉同步腳本與踩坑表",
       "version": "0.1.0",

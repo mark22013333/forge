@@ -2,15 +2,10 @@
 # 預設忽略所有 .spec/ 子項目，結案時逐個用 !<path> 放行
 .spec/*
 !.spec/_index.md
-!.spec/centralized-db/
-!.spec/ctx-save-v3/
 
 # Claude Code project lock / Playwright temp
 .claude/
 .playwright-mcp/
-
-# ctx-save runtime database
-.ctx-save/
 
 # macOS
 .DS_Store
