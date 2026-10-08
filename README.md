@@ -1,6 +1,6 @@
 # Forge — Claude Code Plugin Marketplace
 
-通用開發工具集，提供 Git 工作流、對話重點快照等實用 Plugin。
+通用開發工具集，提供 Git 工作流、CI 導入等實用 Plugin。
 
 ## 快速安裝
 
@@ -10,7 +10,6 @@ claude plugin marketplace add mark22013333/forge
 
 # 安裝需要的 Plugin
 claude plugin install git-tools
-claude plugin install ctx-save
 claude plugin install ci-tools
 ```
 
@@ -47,34 +46,6 @@ claude plugin install ci-tools
 ```bash
 claude plugin install git-tools
 ```
-
----
-
-### ctx-save — 對話重點快照 + Web Viewer
-
-在 Claude Code 自動壓縮前保存對話重點。支援 Markdown 與 SQLite 儲存、PostToolUse Hook 自動提醒、Web Viewer 視覺化瀏覽。
-
-| Skill | 類型 | 說明 |
-|-------|------|------|
-| `ctx-save` | 手動 | `/ctx-save` 把當前對話重點寫入 SQLite + Markdown |
-| `ctx-view` | User-invocable | `/ctx-view` 背景啟動 Web Viewer（預設 `http://127.0.0.1:29898`） |
-| `ctx-view-stop` | User-invocable | `/ctx-view-stop` 優雅停止 Web Viewer |
-
-**功能特點**
-
-- 純 Python 標準庫，無任何 pip 依賴
-- Web UI：瀏覽 / 搜尋 / 刪除 / 複製（內容 & 含 frontmatter 的 Markdown）
-- 批次刪除 Modal（依分類 + 日期範圍預覽後執行）
-- Port 衝突自動遞增 + lsof 診斷占用者
-- Server 重用判斷：PID file + `/api/ping` 雙保險
-- Context 超過閾值時 PostToolUse hook 自動提醒
-
-安裝：
-```bash
-claude plugin install ctx-save
-```
-
-詳細使用方式：[plugins/ctx-save/README.md](plugins/ctx-save/README.md)
 
 ---
 
@@ -133,7 +104,7 @@ claude plugin update <plugin-name>@forge
 python3 scripts/sync-versions.py
 
 # 3. commit（pre-commit hook 會再驗證一次）
-git add . && git commit -m "chore(ctx-save): 升版 2.3.2"
+git add . && git commit -m "chore(<plugin-name>): 升版 <X.Y.Z>"
 ```
 
 首次 clone 後啟用 hook：

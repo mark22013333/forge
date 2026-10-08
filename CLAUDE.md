@@ -41,5 +41,5 @@ Key routing rules:
 
 ## Health Stack
 
-- test: python3 -m pytest plugins/ctx-save/skills/ctx-save/scripts/tests/
-- shell: bash -n plugins/ctx-save/skills/ctx-save/scripts/ctx-alert.sh
+- test: bash plugins/ci-tools/tests/sync-gitea-to-ado.test.sh
+- shell: bash -n plugins/ci-tools/scripts/sync-gitea-to-ado.sh
