@@ -21,6 +21,10 @@
 #   -h, --help           顯示說明
 #
 # 結束碼：0 正常；1 參數或執行錯誤、或指定的分支兩邊都不存在；2 有分叉，--apply 未推任何分支
+#
+# 已知限制：狀態是在 fetch 當下判定的。若 fetch 之後、推送之前有人直接推到 ADO，
+#           該分支的推送會被遠端以非快轉拒絕，腳本在那一步中止，之前已推的分支不會做 ls-remote 驗證。
+#           遇到時重跑一次預覽即可看到最新狀態。
 
 set -euo pipefail
 
@@ -57,8 +61,10 @@ fi
 SSH_PREFIX=""
 if [ -n "$KEY" ]; then
   [ -f "$KEY" ] || { echo "錯誤：找不到金鑰 $KEY" >&2; exit 1; }
-  export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o IdentityAgent=none"
-  SSH_PREFIX="GIT_SSH_COMMAND='$GIT_SSH_COMMAND' "
+  # git 會用 shell 解析 GIT_SSH_COMMAND，路徑要跳脫（含空白或引號時才不會壞）
+  GIT_SSH_COMMAND="ssh -i $(printf '%q' "$KEY") -o IdentitiesOnly=yes -o IdentityAgent=none"
+  export GIT_SSH_COMMAND
+  SSH_PREFIX="GIT_SSH_COMMAND=$(printf '%q' "$GIT_SSH_COMMAND") "
 fi
 
 # 踩坑 16：工作 clone 放持久目錄，不放 /tmp（macOS 會定期清掉久未存取的檔案）
