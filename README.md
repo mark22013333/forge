@@ -11,6 +11,7 @@ claude plugin marketplace add mark22013333/forge
 # 安裝需要的 Plugin
 claude plugin install git-tools
 claude plugin install ctx-save
+claude plugin install ci-tools
 ```
 
 安裝後**重啟 Claude Code** 使 Plugin 生效。
@@ -74,6 +75,41 @@ claude plugin install ctx-save
 ```
 
 詳細使用方式：[plugins/ctx-save/README.md](plugins/ctx-save/README.md)
+
+---
+
+### ci-tools — 自架 Azure DevOps Server 導入 CI
+
+引導把自架 Azure DevOps Server 接上既有 Gitea 專案的 CI，附 pipeline 範本、Gradle init script、Gitea → ADO 同步腳本與實際導入時整理的踩坑表。
+
+| Skill | 說明 | 觸發方式 |
+|-------|------|---------|
+| `ado-ci-onboard` | 從評估、安裝、匯入 repo、套範本到 REST API 驗證建置的導入流程 | 「導入 CI」「自架 Azure DevOps」「ADO Server」「Gitea 同步到 ADO」「pipeline 範本」 |
+
+**功能特點**
+
+- 24 條踩坑（症狀／根因／解法／驗證狀態），估計值與未釐清的項目照實標示
+- `ci-init.gradle`：不改 build.gradle，關閉 failFast、每個測試類別獨立 JVM、只跑近期修改的測試（清單為空即失敗）
+- Pipeline 範本：Gradle＋JDK17（流程已在作者環境實測；去識別化改寫版未重新執行），Maven JDK8／JDK25、Vue、Python（未驗證）
+- `sync-gitea-to-ado.sh`：預設只預覽，`--apply` 才推；只快轉、分叉就停、保護分支只印指令
+- 專案專屬值放在各專案的 `.ci-tools.yml`，不進 plugin
+
+**同步腳本參數**
+
+```
+--gitea <url>        Gitea repo 網址（必填）
+--ado <url>          ADO repo 網址（必填）
+--branches <a,b>     只處理這些分支
+--key <path>         SSH 私鑰（只用這把，不讀 ssh-agent）
+--workdir <path>     本機工作 clone 路徑
+--protected <a,b>    保護分支清單（預設 main,master,production）
+--apply              實際推送（未帶時只預覽）
+```
+
+安裝：
+```bash
+claude plugin install ci-tools
+```
 
 ---
 

@@ -1,0 +1,51 @@
+# Azure Pipelines 範本：Python（pytest，Windows 自架 agent）
+#
+# 驗證狀態：未驗證。這份範本沒有在任何 ADO 環境實際跑過。
+#           第一次套用時，請照 SKILL.md 第 5 章用 REST API 逐項確認，並把結果回寫到這段標示。
+#
+# 套用前要做的事：
+#   1. 確認 repo 根目錄有 requirements.txt（或改成專案實際的安裝方式）
+#   2. agent 要有 capability 標籤 python
+
+trigger:
+  branches:
+    include:
+    - main
+    - uat
+
+parameters:
+- name: pythonExe
+  displayName: Python 執行檔路徑
+  type: string
+  default: 'C:\Python312\python.exe'
+- name: pipCache
+  displayName: pip 快取路徑（agent 帳戶要能寫入）
+  type: string
+  default: 'D:\ci-cache\pip'
+
+pool:
+  name: Default
+  demands:
+  - python
+
+steps:
+- checkout: self
+
+# [推測] 與踩坑 7 同理，agent 帳戶沒有使用者資料夾，pip 快取明確指定可寫路徑
+- script: |
+    "${{ parameters.pythonExe }}" -m venv .venv
+    .venv\Scripts\python.exe -m pip install -r requirements.txt pytest
+  displayName: 建立虛擬環境與安裝依賴
+  env:
+    PIP_CACHE_DIR: ${{ parameters.pipCache }}
+
+- script: .venv\Scripts\python.exe -m pytest --junitxml=reports/junit.xml
+  displayName: 測試
+
+- task: PublishTestResults@2
+  displayName: 發佈測試結果
+  condition: succeededOrFailed()
+  inputs:
+    testResultsFormat: JUnit
+    testResultsFiles: 'reports/junit.xml'
+    failTaskOnFailedTests: false
