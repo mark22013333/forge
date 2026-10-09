@@ -1,13 +1,25 @@
-# Azure Pipelines 範本：Gradle ＋ JDK 17（Windows 自架 agent）
+# Azure Pipelines 範本：Gradle ＋ JDK 17（Windows 自架 agent，可含多個依賴 repo）
 #
-# 驗證狀態：流程已在作者環境實測（離線建置、近期測試篩選、init script、發佈測試結果）。
-#           本檔是去識別化的改寫版，改寫後沒有在 ADO 上重新執行過。
+# 驗證狀態：這個結構（jobs＋timeoutInMinutes、指定 Gradle task、依賴 repo 並排 checkout、離線建置、
+#           近期測試篩選、init script、發佈測試結果）已在一個真實專案（Gradle 8.14.3、主 repo＋1 個依賴 repo）
+#           跑到綠燈。本檔是去識別化並參數化的改寫版，改寫後沒有在 ADO 上重新執行過。
+#           其中 dependencyRepos 以 ${{ each }} 產生 checkout 步驟的寫法，真實專案是寫死的，參數化版本未驗證。
 #           第一次套用後，請照 SKILL.md 第 5 章用 REST API 確認 timeline、log、測試統計。
 #
 # 套用前要做的事：
 #   1. 把 ci-init.gradle 複製到專案的 ci/ci-init.gradle（或修改下方 initScript 參數）
-#   2. 把 <...> 佔位符換成專案的值；實際值記在專案自己的 .ci-tools.yml，不要寫回公開範本
-#   3. agent 要有 capability 標籤 JDK17（SKILL.md 第 2 章）
+#   2. 參數預設值從 .ci-tools.yml（gradle_tasks、recent_test_days、timeout_minutes、offline）
+#      與 servers.yml 的 agent 設定（jdk、gradle_user_home、npm_cache）填入；實際值不要寫回公開範本
+#   3. 有依賴 repo 時，resources.repositories 與 dependencyRepos 兩處都要填（見下方註解）
+#   4. agent 要有 capability 標籤 JDK17（SKILL.md 第 2 章）
+#
+# 第一次建置前（踩坑 25、26）：
+#   - 比對專案 gradle/wrapper/gradle-wrapper.properties 的版本與 servers.yml 的 cached_gradle_versions。
+#     不在清單內＝這台 agent 的快取沒有這個 Gradle 版本解析過的套件，離線建置會在第一個外掛就「not found」。
+#     第一次手動執行時把 offline 取消勾選，跑成功後再把版本補進 cached_gradle_versions。
+#   - 第一次連線建置要下載依賴（實例約 20 分鐘），加上 forkEvery=1 的測試（實例約 40～50 分鐘），
+#     超過 ADO 預設的 60 分鐘 job 逾時，所以 timeoutInMinutes 預設 120。
+#   - pipeline 檔若只在測試分支，網頁第一次 Run 時要把分支改成含這個 yaml 的分支（踩坑 28）。
 
 trigger:
   branches:
@@ -17,23 +29,50 @@ trigger:
 
 parameters:
 - name: offline
-  displayName: 離線建置（--offline）
+  displayName: 離線建置（--offline）；新的 Gradle 版本第一次要取消（踩坑 25）
   type: boolean
   default: true
+- name: gradleTasks
+  displayName: Gradle task（多模組且有子專案編不過時，明確指定，例：:test :product-core:test，踩坑 30）
+  type: string
+  default: 'test'
+- name: timeoutInMinutes
+  displayName: job 逾時（分鐘）；ADO 預設 60，首次建置不夠（踩坑 26）
+  type: number
+  default: 120
 - name: recentTestDays
   displayName: 只跑最近 N 天修改過的測試（0 表示跑全部）
   type: number
   default: 0
 - name: jdkHome
-  displayName: JDK 17 路徑
+  displayName: JDK 17 路徑（servers.yml 的 agents[].jdk.JDK17）
   type: string
   default: 'C:\Java\jdk-17'
+- name: gradleUserHome
+  displayName: Gradle 快取路徑（servers.yml 的 agents[].gradle_user_home；所有專案共用）
+  type: string
+  default: 'D:\ci-cache\gradle'
+- name: npmCache
+  displayName: npm 快取路徑（建置過程會跑 npm 時才用到；踩坑 7）
+  type: string
+  default: 'D:\ci-cache\npm'
+- name: selfPath
+  displayName: 本 repo 的 checkout 目錄名（要對上依賴 repo 在 settings.gradle 裡的相對路徑）
+  type: string
+  default: 'project-a'
+- name: dependencyRepos
+  displayName: 依賴 repo（alias 要和 resources.repositories 的 repository 一致；path 為並排的目錄名）
+  type: object
+  default: []
+  # 例：
+  # - alias: product-core
+  #   path: product-core
 - name: initScript
   displayName: ci-init.gradle 在 repo 內的路徑
   type: string
   default: 'ci/ci-init.gradle'
 - name: extraGradleArgs
-  displayName: 額外 Gradle 參數（例：-x <子專案>:test 暫時排除本來就壞的子專案）
+  displayName: 額外 Gradle 參數（例：-x <子專案>:test 暫時排除本來就壞的子專案，踩坑 13）
   type: string
   default: ' '
 
@@ -46,14 +85,22 @@ pool:
 variables:
 - name: JAVA_HOME
   value: ${{ parameters.jdkHome }}
+- name: GRADLE_USER_HOME
+  value: ${{ parameters.gradleUserHome }}
+- name: NPM_CONFIG_CACHE
+  value: ${{ parameters.npmCache }}
 - ${{ if eq(parameters.offline, true) }}:
   - name: offlineFlag
     value: '--offline'
 - ${{ if ne(parameters.offline, true) }}:
   - name: offlineFlag
-    value: ''
+    value: '--console=plain'   # 給無害的旗標，避免變數為空字串
 
-# 多 repo 並排 checkout（踩坑 14）：settings.gradle 以相對路徑引用同層 repo 時才需要
+# 依賴 repo 並排 checkout（踩坑 14）：settings.gradle 以相對路徑引用同層 repo 時才需要。
+# 每個依賴 repo 一筆；name 是「ADO 專案/repo」，ref 是要用的分支。
+# 這裡保持明確列出，不用參數產生：resources 區塊能否用 ${{ each }} 展開沒有驗證過。
+# 推送順序：同步時先推依賴 repo、再推主 repo（sync-all-repos.sh 會照 role 排序），
+# 否則主 repo 觸發的建置可能拿到舊的依賴。
 # resources:
 #   repositories:
 #   - repository: product-core
@@ -61,57 +108,67 @@ variables:
 #     name: <ADO 專案>/product-core
 #     ref: refs/heads/main
 
-steps:
-- checkout: self
-  fetchDepth: 0          # 近期測試篩選需要完整歷史（踩坑 12）
-  path: s/project-a      # 並排 checkout 時，路徑要對上 settings.gradle 的相對路徑
-# - checkout: product-core
-#   path: s/product-core
-
-- ${{ if gt(parameters.recentTestDays, 0) }}:
-  - task: PowerShell@2
-    displayName: 列出近期修改的測試類別
-    inputs:
-      targetType: inline
-      workingDirectory: $(Pipeline.Workspace)/s/project-a
-      script: |
-        # agent 服務的 PATH 沒有 git，用 agent 內附的那份（踩坑 6）
-        $git = Join-Path $env:AGENT_HOMEDIRECTORY 'externals\git\cmd\git.exe'
-        $since = '${{ parameters.recentTestDays }} days ago'
-        $paths = & $git log "--since=$since" --name-only --pretty=format: -- '*Test.java' |
-          Where-Object { $_ -and (Test-Path $_) } | Sort-Object -Unique
-        $classes = @($paths | ForEach-Object {
-          ($_ -replace '^.*src/test/java/', '' -replace '\.java$', '') -replace '/', '.'
-        })
-        if ($classes.Count -eq 0) {
-          Write-Error "最近 $since 沒有修改過的測試類別；清單為空會變成零測試假綠燈，停止建置"
-          exit 1
-        }
-        $list = Join-Path $env:AGENT_TEMPDIRECTORY 'recent-tests.txt'
-        # 不用 Set-Content -Encoding UTF8：Windows PowerShell 5 會寫入 BOM
-        [System.IO.File]::WriteAllLines($list, [string[]]$classes)
-        Write-Host "近期測試 $($classes.Count) 個："
-        $classes | ForEach-Object { Write-Host "  $_" }
-        Write-Host "##vso[task.setvariable variable=RECENT_TESTS_FILE]$list"
-
-- script: >
-    gradlew.bat clean test $(offlineFlag)
-    --init-script "${{ parameters.initScript }}"
-    "-Dorg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g"
-    --no-daemon ${{ parameters.extraGradleArgs }}
+jobs:
+- job: build
   displayName: Gradle 建置與測試
-  workingDirectory: $(Pipeline.Workspace)/s/project-a
-  env:
-    JAVA_HOME: $(JAVA_HOME)
-    # 測試需要的環境變數放這裡（踩坑 9），值用 pipeline 變數或 secret，不要寫死
-    # PRODUCT_HOME: $(PRODUCT_HOME)
+  timeoutInMinutes: ${{ parameters.timeoutInMinutes }}
+  steps:
+  - checkout: self
+    fetchDepth: 0          # 近期測試篩選需要完整歷史（踩坑 12）
+    path: s/${{ parameters.selfPath }}
+  - ${{ each repo in parameters.dependencyRepos }}:
+    - checkout: ${{ repo.alias }}
+      path: s/${{ repo.path }}
 
-- task: PublishTestResults@2
-  displayName: 發佈測試結果
-  condition: succeededOrFailed()
-  inputs:
-    testResultsFormat: JUnit
-    testResultsFiles: '**/build/test-results/test/TEST-*.xml'
-    searchFolder: $(Pipeline.Workspace)/s/project-a
-    # 測試分頁的數字可能和 Gradle 輸出不同（踩坑 20，原因未釐清），成敗以 Gradle 為準
-    failTaskOnFailedTests: false
+  - ${{ if gt(parameters.recentTestDays, 0) }}:
+    - task: PowerShell@2
+      displayName: 列出近期修改的測試類別
+      inputs:
+        targetType: inline
+        workingDirectory: $(Pipeline.Workspace)/s/${{ parameters.selfPath }}
+        script: |
+          # agent 服務的 PATH 沒有 git，用 agent 內附的那份（踩坑 6）
+          $git = Join-Path $env:AGENT_HOMEDIRECTORY 'externals\git\cmd\git.exe'
+          $since = '${{ parameters.recentTestDays }} days ago'
+          $paths = & $git log "--since=$since" --name-only --pretty=format: -- '*Test.java' |
+            Where-Object { $_ -and (Test-Path $_) } | Sort-Object -Unique
+          $classes = @($paths | ForEach-Object {
+            ($_ -replace '^.*src/test/java/', '' -replace '\.java$', '') -replace '/', '.'
+          })
+          if ($classes.Count -eq 0) {
+            Write-Error "最近 $since 沒有修改過的測試類別；清單為空會變成零測試假綠燈，停止建置"
+            exit 1
+          }
+          $list = Join-Path $env:AGENT_TEMPDIRECTORY 'recent-tests.txt'
+          # 不用 Set-Content -Encoding UTF8：Windows PowerShell 5 會寫入 BOM
+          [System.IO.File]::WriteAllLines($list, [string[]]$classes)
+          Write-Host "近期測試 $($classes.Count) 個："
+          $classes | ForEach-Object { Write-Host "  $_" }
+          Write-Host "##vso[task.setvariable variable=RECENT_TESTS_FILE]$list"
+
+  # --continue：某個子專案的測試失敗時，其他子專案照樣跑完，一次看到全部失敗
+  # 不加 clean：兩個實際導入的專案都沒有用 clean（agent 每次 checkout 乾淨的工作目錄）；需要時在 gradleTasks 前面加上 clean
+  - script: >
+      gradlew.bat ${{ parameters.gradleTasks }} --continue $(offlineFlag)
+      --init-script "${{ parameters.initScript }}"
+      "-Dorg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g"
+      --no-daemon ${{ parameters.extraGradleArgs }}
+    displayName: Gradle 建置與測試
+    workingDirectory: $(Pipeline.Workspace)/s/${{ parameters.selfPath }}
+    env:
+      JAVA_HOME: $(JAVA_HOME)
+      GRADLE_USER_HOME: $(GRADLE_USER_HOME)
+      NPM_CONFIG_CACHE: $(NPM_CONFIG_CACHE)
+      # 測試需要的環境變數放這裡（踩坑 9），值用 pipeline 變數或 secret，不要寫死
+      # PRODUCT_HOME: $(Pipeline.Workspace)\s\${{ parameters.selfPath }}
+
+  - task: PublishTestResults@2
+    displayName: 發佈測試結果
+    condition: succeededOrFailed()
+    inputs:
+      testResultsFormat: JUnit
+      testResultsFiles: '**/build/test-results/test/TEST-*.xml'
+      # 搜尋整個 s/，涵蓋主 repo 與依賴 repo 的測試結果
+      searchFolder: $(Pipeline.Workspace)/s
+      # 測試分頁的數字可能和 Gradle 輸出不同（踩坑 20，原因未釐清），成敗以 Gradle 為準
+      failTaskOnFailedTests: false
