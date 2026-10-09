@@ -1,0 +1,35 @@
+# servers.yml — 使用者層設定：ADO Server 的共用資訊（每台 server 只寫一次，所有專案共用）
+#
+# 放置位置：${XDG_CONFIG_HOME:-~/.config}/ci-tools/servers.yml
+#           （腳本也接受 --servers <路徑> 或環境變數 CI_TOOLS_SERVERS 指定）
+# 這個檔案含內部主機名與金鑰路徑，只放在自己的電腦，不要提交到任何 repo。
+# 權杖本身不寫在這裡，只寫「權杖放在哪個環境變數」（pat_env）。
+#
+# 格式限制：腳本用內建的簡易解析器讀取（不需要 PyYAML／yq），只支援
+#   巢狀 mapping、區塊清單、行內清單 [a, b]、引號字串與 # 註解；
+#   不支援多行字串（| >）、錨點與行內 mapping {a: 1}。
+
+default_server: home-ado          # .ci-tools.yml 沒寫 server 時使用
+
+servers:
+  home-ado:                       # server 名稱，專案層 .ci-tools.yml 的 server 欄位引用它
+    url: http://ado-host:8080     # 網頁與 REST API 的根網址（不含 collection）
+    collection: Collection        # collection 名稱
+    api_version: "6.0"            # REST API 的 api-version；依伺服器版本調整
+    # 專案 repo 的 SSH 網址樣式；{collection} {project} {repo} 由腳本代入
+    ssh_url: ssh://ado-host:22/{collection}/{project}/_git/{repo}
+    ssh_key: ~/.ssh/ado_ci_rsa    # ADO 內建 SSH 只收 RSA（踩坑 4）
+    # 權杖所在的環境變數名稱。可以有多個用途不同的權杖，這裡寫「建置／推送」要用的那一個。
+    # 範圍對照見 SKILL.md「權杖（PAT）與權限範圍」：唯讀權杖只能查詢，建專案、推送、排建置都會 401。
+    pat_env: ADO_PAT
+    agents:
+      - name: build-agent-1
+        os: windows
+        jdk:                      # capability 標籤 → JDK 路徑
+          JDK17: 'C:\Java\jdk-17'
+          JDK8: 'C:\Java\jdk-8'
+        gradle_user_home: 'D:\ci-cache\gradle'   # 所有 Gradle 專案共用的快取（離線建置靠它）
+        npm_cache: 'D:\ci-cache\npm'             # NetworkService 沒有使用者資料夾（踩坑 7）
+        # 這個快取已經「連線跑過一次」的 Gradle 版本。Gradle 的解析快取依版本分開，
+        # 新版本第一次建置必須取消 offline（踩坑 25）。跑過之後把版本補進來。
+        cached_gradle_versions: [7.5.1, 8.14.3]

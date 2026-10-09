@@ -1,0 +1,37 @@
+# .ci-tools.yml — 專案層設定：這個專案自己的 CI 參數
+#
+# 放置位置：專案 repo 根目錄。含內部網址，要加進該專案的 .gitignore，或確認只放在私有 repo。
+# server 層的資訊（主機、collection、SSH 金鑰、權杖變數名、agent 路徑）不寫在這裡，
+# 寫在使用者層的 servers.yml（見 servers.example.yml），這裡只用 server 名稱引用。
+#
+# 格式限制同 servers.example.yml（內建簡易解析器）。
+
+server: home-ado                  # 對應 servers.yml 的 servers.<名稱>；省略時用 default_server
+ado_project: project-a            # ADO 上的專案名稱
+
+# 一個專案可能有多個 repo（例：主 repo 的 settings.gradle 以 ../product-core 引用同層的核心 repo）。
+# 同步腳本依 role 排順序：dependency 先推、main 最後推，避免 CI 先被觸發卻拿到舊的依賴（踩坑 14）。
+repos:
+  - name: project-a
+    role: main
+    gitea_url: ssh://git@gitea.example.com/team/project-a.git
+    ado_repo: project-a           # 省略時等於 name
+    branches: [main, uat]         # 要同步的分支；省略表示兩邊全部
+  - name: product-core
+    role: dependency
+    gitea_url: ssh://git@gitea.example.com/team/product-core.git
+    ado_repo: product-core
+    branches: [main]
+    # ado_url: ssh://...          # 需要時可直接指定，覆寫 servers.yml 的 ssh_url 樣式
+    # ssh_key: ~/.ssh/other_rsa   # 需要時可覆寫 server 的金鑰
+
+protected_branches: [main, master, production]   # 同步腳本只印指令、不代推（踩坑 24）
+
+# pipeline 參數（套範本時填進 parameters 的預設值）
+gradle_tasks: ':test :product-core:test'   # 多模組且有子專案編不過時，明確指定（踩坑 30）；單模組用 test
+recent_test_days: 0               # 0 表示跑全部測試
+timeout_minutes: 120              # job 逾時；ADO 預設 60 分鐘，首次建置不夠（踩坑 26）
+offline: true                     # 日常離線建置；新 Gradle 版本第一次要連線（踩坑 25）
+
+# 首次建置失敗分類用：產品原始版本的分支或 tag（ci-triage.sh 用它比對測試檔是否被本專案改過）
+baseline_branch: product-base

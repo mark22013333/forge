@@ -41,5 +41,5 @@ Key routing rules:
 
 ## Health Stack
 
-- test: bash plugins/ci-tools/tests/sync-gitea-to-ado.test.sh
-- shell: bash -n plugins/ci-tools/scripts/sync-gitea-to-ado.sh
+- test: bash plugins/ci-tools/tests/run-all.sh
+- shell: for f in plugins/ci-tools/scripts/*.sh; do bash -n "$f"; done

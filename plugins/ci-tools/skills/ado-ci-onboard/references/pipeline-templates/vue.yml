@@ -16,6 +16,10 @@ trigger:
     - uat
 
 parameters:
+- name: timeoutInMinutes
+  displayName: job 逾時（分鐘）；ADO 預設 60，首次建置要下載依賴時常不夠（踩坑 26）
+  type: number
+  default: 120
 - name: npmCache
   displayName: npm 快取路徑（agent 帳戶要能寫入）
   type: string
@@ -26,30 +30,34 @@ pool:
   demands:
   - node
 
-steps:
-- checkout: self
+jobs:
+- job: build
+  displayName: 前端建置與測試
+  timeoutInMinutes: ${{ parameters.timeoutInMinutes }}
+  steps:
+  - checkout: self
 
-# NetworkService 沒有使用者資料夾，npm 快取預設落在 C:\Users\Default 會 EPERM（踩坑 7）
-- script: npm ci
-  displayName: 安裝依賴
-  env:
-    NPM_CONFIG_CACHE: ${{ parameters.npmCache }}
+  # NetworkService 沒有使用者資料夾，npm 快取預設落在 C:\Users\Default 會 EPERM（踩坑 7）
+  - script: npm ci
+    displayName: 安裝依賴
+    env:
+      NPM_CONFIG_CACHE: ${{ parameters.npmCache }}
 
-- script: npm run test:unit -- --reporter=junit --outputFile=reports/junit.xml
-  displayName: 單元測試
-  env:
-    NPM_CONFIG_CACHE: ${{ parameters.npmCache }}
-    CI: 'true'
+  - script: npm run test:unit -- --reporter=junit --outputFile=reports/junit.xml
+    displayName: 單元測試
+    env:
+      NPM_CONFIG_CACHE: ${{ parameters.npmCache }}
+      CI: 'true'
 
-- script: npm run build
-  displayName: 建置
-  env:
-    NPM_CONFIG_CACHE: ${{ parameters.npmCache }}
+  - script: npm run build
+    displayName: 建置
+    env:
+      NPM_CONFIG_CACHE: ${{ parameters.npmCache }}
 
-- task: PublishTestResults@2
-  displayName: 發佈測試結果
-  condition: succeededOrFailed()
-  inputs:
-    testResultsFormat: JUnit
-    testResultsFiles: 'reports/junit.xml'
-    failTaskOnFailedTests: false
+  - task: PublishTestResults@2
+    displayName: 發佈測試結果
+    condition: succeededOrFailed()
+    inputs:
+      testResultsFormat: JUnit
+      testResultsFiles: 'reports/junit.xml'
+      failTaskOnFailedTests: false

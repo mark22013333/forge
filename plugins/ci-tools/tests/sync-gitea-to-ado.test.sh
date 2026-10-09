@@ -2,6 +2,8 @@
 # sync-gitea-to-ado.sh 的離線測試：用兩個本機 bare repo 模擬 Gitea 與 ADO，不連任何真實主機。
 # 執行：bash plugins/ci-tools/tests/sync-gitea-to-ado.test.sh
 # 暫存目錄由 mktemp 建立，測試結束後不清理（路徑會印出來）。
+# check 以 eval 執行單引號字串，變數要延後展開；BEFORE／RC 由 eval 內使用，shellcheck 看不到。
+# shellcheck disable=SC2016,SC2034,SC2001
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
