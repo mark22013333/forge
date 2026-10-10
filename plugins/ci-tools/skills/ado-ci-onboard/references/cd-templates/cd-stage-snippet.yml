@@ -1,0 +1,73 @@
+# CD stage 片段：只在 ADO 的部署分支（例：SIT）執行，把 Build stage 產出的產物部署到 VM（cd-ssh-vm.md 第 4 步）
+#
+# 驗證狀態：未驗證。結構來自一個實際專案；其中 Build Artifacts 傳遞產物與 DownloadSecureFile 已在該專案實跑成功，
+#           但部署步驟（deploy-vm.ps1）尚未有一次成功的 dry-run，也未正式部署。本檔另經去識別化改寫。
+#
+# 套用方式：
+#   - 主 pipeline 改成 stages（Build ＋ 本檔的 Deploy），trigger 加上部署分支
+#   - Build stage 的 job 最後加上「發佈產物」步驟（見下方 BUILD_STAGE_TAIL 註解區塊）
+#   - 部署分支、secure file 名稱、產物檔名、VM 參數依專案填入；不要把實際值寫回公開範本
+#   - ADO Server（自架）不支援 Pipeline Artifacts（task 查得到、執行才報錯），一律用 Build Artifacts
+
+# ---- BUILD_STAGE_TAIL：加在 Build stage 的 job steps 最後 ----
+#      - task: PublishBuildArtifacts@1
+#        displayName: '發佈產物（部署用）'
+#        condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/<部署分支>'))
+#        inputs:
+#          PathtoPublish: $(Build.SourcesDirectory)/build/libs   # 產物所在目錄
+#          ArtifactName: app
+#          publishLocation: Container
+
+# ---- 主 pipeline 頂層參數（加在 parameters 區）----
+# - name: deployDryRun
+#   displayName: '部署只做預檢（dry-run，不動服務）'
+#   type: boolean
+#   default: false
+
+stages:
+- stage: Deploy
+  displayName: '部署到 <環境>'
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/<部署分支>'))
+  jobs:
+  - job: deploy
+    displayName: '部署到 VM'
+    # 分段上傳＋停止／健康檢查／可能的回滾；依產物大小調整
+    timeoutInMinutes: 60
+    steps:
+      # 需要 repo 內的 deploy-vm.ps1、主機金鑰檔、遠端腳本
+      - checkout: self
+        fetchDepth: 1
+
+      - task: DownloadBuildArtifacts@1
+        displayName: '取得產物'
+        inputs:
+          buildType: current
+          downloadType: single
+          artifactName: app
+          downloadPath: $(Pipeline.Workspace)     # 檔案會在 $(Pipeline.Workspace)\app\
+
+      # 連 VM 的 CD 專用私鑰（Library → Secure files）；pipeline 需先被授權使用（pipelinePermissions/securefile）
+      - task: DownloadSecureFile@1
+        name: deployKey
+        displayName: '取得部署金鑰'
+        inputs:
+          secureFile: '<secure file 名稱>'
+
+      - powershell: |
+          $artifact = Get-ChildItem '$(Pipeline.Workspace)\app' -Filter '*.war' | Where-Object { $_.Name -notlike '*-plain.war' } | Select-Object -First 1
+          if (-not $artifact) { Write-Host '##vso[task.logissue type=error]找不到產物'; exit 1 }
+          $a = @{
+            Artifact       = $artifact.FullName
+            KeyFile        = '$(deployKey.secureFilePath)'
+            KnownHostsFile = '$(Build.SourcesDirectory)\ci\<環境>_known_hosts'
+            RemoteScript   = '$(Build.SourcesDirectory)\<遠端腳本路徑>'
+            VmHost         = '<VM 位址>'
+            VmUser         = '<VM 帳號>'
+            RemoteStaging  = '<VM 上的暫存目錄>'
+            Commit         = '$(Build.SourceVersion)'.Substring(0, 9)
+          }
+          if ('${{ parameters.deployDryRun }}' -eq 'True') { $a['DryRun'] = $true }
+          & '$(Build.SourcesDirectory)\ci\deploy-vm.ps1' @a
+          exit $LASTEXITCODE
+        displayName: '部署（deploy-vm.ps1）'
