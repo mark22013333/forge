@@ -4,6 +4,11 @@
 #           近期測試篩選、init script、發佈測試結果）已在一個真實專案（Gradle 8.14.3、主 repo＋1 個依賴 repo）
 #           跑到綠燈。本檔是去識別化並參數化的改寫版，改寫後沒有在 ADO 上重新執行過。
 #           其中 dependencyRepos 以 ${{ each }} 產生 checkout 步驟的寫法，真實專案是寫死的，參數化版本未驗證。
+#           另一個真實專案（Gradle 7.5.1、主 repo＋1 個依賴 repo）以同結構跑綠，並驗證了：
+#             - emptyRecentTests: buildOnly（測試多年沒動，沒有近期測試時只建置；連線與離線各一次）
+#             - 近期測試掃描涵蓋依賴 repo
+#             - publishArtifact：以 PublishBuildArtifacts 交給下一個 stage（Server 版不支援 Pipeline Artifacts，踩坑 37）
+#           這些段落在本範本中的參數化寫法同樣未在 ADO 重跑。
 #           第一次套用後，請照 SKILL.md 第 5 章用 REST API 確認 timeline、log、測試統計。
 #
 # 套用前要做的事：
@@ -44,6 +49,29 @@ parameters:
   displayName: 只跑最近 N 天修改過的測試（0 表示跑全部）
   type: number
   default: 0
+- name: emptyRecentTests
+  displayName: 近期沒有修改過的測試時：fail＝讓建置失敗（預設，防假綠燈）；buildOnly＝明確切換成只建置（踩坑 12）
+  type: string
+  default: fail
+  values:
+  - fail
+  - buildOnly
+- name: buildOnlyTasks
+  displayName: 只建置模式要跑的 Gradle task（例：assemble testClasses；war 專案可用 war testClasses）
+  type: string
+  default: 'assemble testClasses'
+- name: publishArtifact
+  displayName: 發佈建置產物給後續 stage（例如部署）；只在 artifactBranch 分支發佈
+  type: boolean
+  default: false
+- name: artifactPath
+  displayName: 要發佈的產物目錄（相對於本 repo 的 checkout 目錄）
+  type: string
+  default: 'build/libs'
+- name: artifactBranch
+  displayName: 發佈產物的分支（完整 ref，例：refs/heads/sit）
+  type: string
+  default: 'refs/heads/sit'
 - name: jdkHome
   displayName: JDK 17 路徑（servers.yml 的 agents[].jdk.JDK17）
   type: string
@@ -130,13 +158,30 @@ jobs:
           # agent 服務的 PATH 沒有 git，用 agent 內附的那份（踩坑 6）
           $git = Join-Path $env:AGENT_HOMEDIRECTORY 'externals\git\cmd\git.exe'
           $since = '${{ parameters.recentTestDays }} days ago'
-          $paths = & $git log "--since=$since" --name-only --pretty=format: -- '*Test.java' |
-            Where-Object { $_ -and (Test-Path $_) } | Sort-Object -Unique
-          $classes = @($paths | ForEach-Object {
-            ($_ -replace '^.*src/test/java/', '' -replace '\.java$', '') -replace '/', '.'
-          })
+          # 本 repo 與所有依賴 repo 都要掃，否則依賴 repo 裡新改的測試永遠不會被選中（踩坑 12）。
+          # 它們都並排 checkout 在 $(Pipeline.Workspace)/s 底下，直接掃那裡的 git 目錄
+          # （範本的 each 指令不能用在 script 字串裡，所以不從 dependencyRepos 參數展開；script 內也不能出現範本運算式的寫法，連註解都不行）
+          $dirs = @(Get-ChildItem '$(Pipeline.Workspace)/s' -Directory | Where-Object { Test-Path (Join-Path $_.FullName '.git') } | ForEach-Object { $_.FullName })
+          Write-Host "掃描的 repo：$($dirs -join ', ')"
+          $classes = @()
+          foreach ($d in $dirs) {
+            Push-Location $d
+            $paths = & $git log "--since=$since" --name-only --pretty=format: -- '*Test.java' |
+              Where-Object { $_ -and (Test-Path $_) } | Sort-Object -Unique
+            $classes += @($paths | ForEach-Object {
+              ($_ -replace '^.*src/test/java/', '' -replace '\.java$', '') -replace '/', '.'
+            })
+            Pop-Location
+          }
+          $classes = @($classes | Sort-Object -Unique)
           if ($classes.Count -eq 0) {
-            Write-Error "最近 $since 沒有修改過的測試類別；清單為空會變成零測試假綠燈，停止建置"
+            if ('${{ parameters.emptyRecentTests }}' -eq 'buildOnly') {
+              # 明確切換成只建置：不跑測試、不載入 init script、不發佈測試結果，不會產生「測試通過」的假象
+              Write-Host "最近 $since 沒有修改過的測試類別：本次只建置（${{ parameters.buildOnlyTasks }}），不跑測試"
+              Write-Host "##vso[task.setvariable variable=CI_RUN_TESTS]false"
+              exit 0
+            }
+            Write-Error "最近 $since 沒有修改過的測試類別；清單為空會變成零測試假綠燈，停止建置（測試多年沒動的專案可改用 emptyRecentTests: buildOnly）"
             exit 1
           }
           $list = Join-Path $env:AGENT_TEMPDIRECTORY 'recent-tests.txt'
@@ -145,6 +190,7 @@ jobs:
           Write-Host "近期測試 $($classes.Count) 個："
           $classes | ForEach-Object { Write-Host "  $_" }
           Write-Host "##vso[task.setvariable variable=RECENT_TESTS_FILE]$list"
+          Write-Host "##vso[task.setvariable variable=CI_RUN_TESTS]true"
 
   # --continue：某個子專案的測試失敗時，其他子專案照樣跑完，一次看到全部失敗
   # 不加 clean：兩個實際導入的專案都沒有用 clean（agent 每次 checkout 乾淨的工作目錄）；需要時在 gradleTasks 前面加上 clean
@@ -154,6 +200,8 @@ jobs:
       "-Dorg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g"
       --no-daemon ${{ parameters.extraGradleArgs }}
     displayName: Gradle 建置與測試
+    # CI_RUN_TESTS 只有在 buildOnly 且沒有近期測試時才是 false；recentTestDays=0 時未定義，照常跑測試
+    condition: and(succeeded(), ne(variables['CI_RUN_TESTS'], 'false'))
     workingDirectory: $(Pipeline.Workspace)/s/${{ parameters.selfPath }}
     env:
       JAVA_HOME: $(JAVA_HOME)
@@ -162,9 +210,22 @@ jobs:
       # 測試需要的環境變數放這裡（踩坑 9），值用 pipeline 變數或 secret，不要寫死
       # PRODUCT_HOME: $(Pipeline.Workspace)\s\${{ parameters.selfPath }}
 
+  # 只建置模式：不載入 init script（它會拒絕空清單），只驗證程式碼（含測試碼）編得過、產物打得出來
+  - script: >
+      gradlew.bat ${{ parameters.buildOnlyTasks }} $(offlineFlag)
+      "-Dorg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g"
+      --no-daemon ${{ parameters.extraGradleArgs }}
+    displayName: Gradle 建置（沒有近期測試，只建置）
+    condition: and(succeeded(), eq(variables['CI_RUN_TESTS'], 'false'))
+    workingDirectory: $(Pipeline.Workspace)/s/${{ parameters.selfPath }}
+    env:
+      JAVA_HOME: $(JAVA_HOME)
+      GRADLE_USER_HOME: $(GRADLE_USER_HOME)
+      NPM_CONFIG_CACHE: $(NPM_CONFIG_CACHE)
+
   - task: PublishTestResults@2
     displayName: 發佈測試結果
-    condition: succeededOrFailed()
+    condition: and(succeededOrFailed(), ne(variables['CI_RUN_TESTS'], 'false'))
     inputs:
       testResultsFormat: JUnit
       testResultsFiles: '**/build/test-results/test/TEST-*.xml'
@@ -172,3 +233,15 @@ jobs:
       searchFolder: $(Pipeline.Workspace)/s
       # 測試分頁的數字可能和 Gradle 輸出不同（踩坑 20，原因未釐清），成敗以 Gradle 為準
       failTaskOnFailedTests: false
+
+  # 交給後續 stage（例如部署）。Server 版只能用 Build Artifacts，PublishPipelineArtifact 會在執行時失敗（踩坑 37）
+  # 下游取用：DownloadBuildArtifacts@1（buildType: current、downloadType: single、artifactName: app），
+  # 檔案會在 <downloadPath>\app\。部署 stage 見 cd-templates/cd-stage-snippet.yml
+  - ${{ if eq(parameters.publishArtifact, true) }}:
+    - task: PublishBuildArtifacts@1
+      displayName: 發佈建置產物
+      condition: and(succeeded(), eq(variables['Build.SourceBranch'], '${{ parameters.artifactBranch }}'))
+      inputs:
+        PathtoPublish: $(Pipeline.Workspace)/s/${{ parameters.selfPath }}/${{ parameters.artifactPath }}
+        ArtifactName: app
+        publishLocation: Container
