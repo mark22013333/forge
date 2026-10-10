@@ -141,6 +141,8 @@ try {
         for ($try = 1; $try -le $ChunkRetries -and -not $ok; $try++) {
             $argList = @($SshOpts + @('-q', "`"$chunkLocal`"", "${Target}:$name.tmp")) | ForEach-Object { if ($_ -match '\s' -and $_ -notmatch '^"') { "`"$_`"" } else { $_ } }
             $p = Start-Process -FilePath $Scp -ArgumentList $argList -NoNewWindow -PassThru
+            # 〔推測〕Windows PowerShell 5.1 未先取得 Handle 時，程序結束後 ExitCode 可能讀到空值；先存取一次 Handle 避免
+            $null = $p.Handle
             # 逾時：scp 會再開 ssh 子程序，用 taskkill /T 連同子程序一起結束
             if (-not $p.WaitForExit($ChunkTimeoutSec * 1000)) { & taskkill /T /F /PID $p.Id 2>&1 | Out-Null; $p.WaitForExit() }
             elseif ($p.ExitCode -eq 0) {

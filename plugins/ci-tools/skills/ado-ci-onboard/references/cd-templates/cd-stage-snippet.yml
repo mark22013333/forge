@@ -1,6 +1,6 @@
 # CD stage 片段：只在 ADO 的部署分支（例：SIT）執行，把 Build stage 產出的產物部署到 VM（cd-ssh-vm.md 第 4 步）
 #
-# 驗證狀態：未驗證。結構來自一個實際專案；其中 Build Artifacts 傳遞產物與 DownloadSecureFile 已在該專案實跑成功，
+# 驗證狀態：未驗證。結構來自一個實際專案；其中 Build Artifacts 傳遞產物已在該專案實跑成功；DownloadSecureFile 步驟執行成功（金鑰內容是否可用要等部署步驟跑通才算確認），
 #           但部署步驟（deploy-vm.ps1）尚未有一次成功的 dry-run，也未正式部署。本檔另經去識別化改寫。
 #
 # 套用方式：
@@ -14,7 +14,7 @@
 #        displayName: '發佈產物（部署用）'
 #        condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/<部署分支>'))
 #        inputs:
-#          PathtoPublish: $(Build.SourcesDirectory)/build/libs   # 產物所在目錄
+#          PathtoPublish: $(Build.SourcesDirectory)/build/libs   # 產物所在目錄；用 gradle17 範本時改用它的 publishArtifact 參數（路徑為 $(Pipeline.Workspace)/s/<selfPath>/<artifactPath>）
 #          ArtifactName: app
 #          publishLocation: Container
 

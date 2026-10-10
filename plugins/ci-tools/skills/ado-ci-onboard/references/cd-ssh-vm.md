@@ -38,7 +38,7 @@ agent 主機的網路與你的筆電不同（實例中走另一張虛擬網卡�
 - 探完刪除 pipeline 與 repo。注意：推入含 `azure-pipelines.yml` 的新 repo 時，ADO 會**自動多建一條** `<repo> CI` pipeline，也要一起刪
 - 探測步驟可能顯示失敗：ssh 把「已加入 known hosts」的警告寫到 stderr，PowerShell 視為錯誤。看輸出內容判斷，不要只看結果
 
-實例的探測結果：TCP 22 可達、SSH 握手成功；agent 內附的是 MinGit，**沒有 bash、unzip、sha256sum、scp**，只有 `C:\Windows\System32\OpenSSH\ssh.exe／scp.exe`。
+實例的探測結果：TCP 22 可達、SSH 握手成功；agent 內附的是 MinGit，**沒有 bash、unzip、sha256sum、scp**（有 `usr\bin\ssh.exe`）；系統另有 `C:\Windows\System32\OpenSSH\ssh.exe／scp.exe`，部署腳本用這一組。
 所以 bash 寫的部署腳本不能直接在 agent 上跑，agent 端改用 PowerShell（`deploy-vm.ps1`）。
 
 ### 2. 專用金鑰與主機金鑰
@@ -69,7 +69,7 @@ agent 主機的網路與你的筆電不同（實例中走另一張虛擬網卡�
 
 1. 撤銷 pipeline 對部署金鑰（secure file）的授權，讀回確認清單為空
 2. 用 REST 建立／移動部署分支（`POST .../_apis/git/repositories/<repo>/refs`，帶 `oldObjectId`）
-3. 自動觸發的那次會在需要金鑰時卡住 → 立刻取消（`PATCH .../_apis/build/builds/<id>`，`{"status":"cancelling"}`）
+3. 自動觸發的建置立刻取消（〔推測〕沒取消到也會卡在等授權、到不了部署步驟；實例都在部署前取消）（`PATCH .../_apis/build/builds/<id>`，`{"status":"cancelling"}`）
 4. 恢復授權、讀回確認
 5. 手動以 `templateParameters: {"deployDryRun":"true"}` 執行（`scripts/ado-run.sh ... -p deployDryRun=true`）
 
@@ -85,14 +85,14 @@ agent 主機的網路與你的筆電不同（實例中走另一張虛擬網卡�
 
 agent 的 PowerShell task 預設用 Windows PowerShell 5.1：
 
-| 陷阱 | 症狀 | 做法 |
-|------|------|------|
-| `.ps1` 沒有 BOM | 以系統 ANSI（例：Big5）解讀，中文變亂碼並吃掉引號，整支腳本 `Unexpected token` | 存成 **UTF-8 with BOM**，檔頭註明 |
-| `ErrorActionPreference=Stop` | 原生程式（ssh／scp）一寫 stderr 就變例外中止 | 呼叫原生程式的函式內暫改為 `Continue`，以 `$LASTEXITCODE` 判斷 |
-| 管線傳字串給原生程式 | 依 `$OutputEncoding` 轉成 ASCII，中文變 `?` | 不用管線；先把腳本寫成檔案 scp 上去，再 ssh 執行 |
-| CRLF | checkout 可能是 CRLF，bash 遇 `\r` 出錯 | 送到 VM 前轉 LF、UTF-8 無 BOM 寫出 |
-| 私鑰權限 | Windows OpenSSH 拒絕其他帳號可讀的私鑰 | 複製一份後 `icacls <key> /inheritance:r /grant:r "<whoami>:R"` |
-| scp 逾時 | scp 會再開 ssh 子程序，只 kill scp 會留下子程序 | `taskkill /T /F /PID <pid>` 結束整棵程序樹 |
+| 陷阱 | 症狀 | 做法 | 驗證狀態 |
+|------|------|------|----------|
+| `.ps1` 沒有 BOM | 以系統 ANSI（例：Big5）解讀，中文變亂碼並吃掉引號，整支腳本 `Unexpected token` | 存成 **UTF-8 with BOM**，檔頭註明 | 部分驗證（踩坑 41） |
+| `ErrorActionPreference=Stop` | 原生程式（ssh／scp）一寫 stderr 就變例外中止 | 呼叫原生程式的函式內暫改為 `Continue`，以 `$LASTEXITCODE` 判斷 | 已遇到（踩坑 42） |
+| 管線傳字串給原生程式 | 依 `$OutputEncoding` 轉成 ASCII，中文變 `?` | 不用管線；先把腳本寫成檔案 scp 上去，再 ssh 執行 | 未驗證（依 PowerShell 5.1 的 `$OutputEncoding` 行為預防） |
+| CRLF | checkout 可能是 CRLF，bash 遇 `\r` 出錯 | 送到 VM 前轉 LF、UTF-8 無 BOM 寫出 | 未驗證（預防） |
+| 私鑰權限 | Windows OpenSSH 拒絕其他帳號可讀的私鑰 | 複製一份後 `icacls <key> /inheritance:r /grant:r "<whoami>:R"` | 未驗證（預防） |
+| scp 逾時 | scp 會再開 ssh 子程序，只 kill scp 會留下子程序 | `taskkill /T /F /PID <pid>` 結束整棵程序樹 | 未驗證（預防） |
 
 **推送前的本機檢查**（省一輪建置）：下載官方 PowerShell 7 tarball（免安裝），以「有 BOM 讀 UTF-8、否則以 Big5 讀」模擬 PS 5.1 讀檔，再用
 `[System.Management.Automation.Language.Parser]::ParseInput` 解析；先拿無 BOM 的舊版做正對照，確認模擬抓得到錯誤。
@@ -122,7 +122,7 @@ agent 的 PowerShell task 預設用 Windows PowerShell 5.1：
 |------|------|
 | 觸發建置（含 dry-run） | Build：Read & execute |
 | 上傳 secure file | Secure Files：Read, create & manage |
-| 授權／撤銷 pipelinePermissions | 實例中既有權杖即可（建專案用的範圍已涵蓋），未另做範圍對照 |
+| 授權／撤銷 pipelinePermissions | **未驗證**是哪個範圍（實例中權杖已含多個範圍，未另做對照；與 SKILL.md 權杖表一致） |
 | 建立／移動部署分支 | Code：Read & write（或以 SSH 金鑰推送） |
 
 ## 驗證狀態

@@ -93,7 +93,7 @@
 
 - **症狀**：`POST _apis/pipelines` 回 401（或回應不是 JSON），看起來像建立失敗。
 - **根因**：權杖缺 Build：讀取與執行時，定義本身已建立，401 來自建立之後的後續動作（推測，未查證是哪一步）。
-- **解法**：**不要直接重送**，先 `GET _apis/pipelines` 列出確認；已存在就讀回它的 `configuration` 檢查 yaml 路徑與 repo id。重送會建出名稱重複的第二條。
+- **解法**：**不要直接重送**，先 `GET _apis/pipelines` 列出確認；已存在就讀回它的 `configuration` 檢查 yaml 路徑與 repo id。〔推測〕重送可能建出名稱重複的第二條（未實測）。
 - **驗證狀態**：已遇到（兩條 pipeline 都出現同樣情況，列表確認皆已建成；根因未做對照實驗）
 
 ### 35. 新專案的 pipeline 一直停在 notStarted，agent 卻閒著
@@ -142,15 +142,15 @@
 
 ### 41. Windows PowerShell 5.1 讀無 BOM 的 .ps1，中文變亂碼、整支腳本無法解析
 
-- **症狀**：repo 裡的 `.ps1` 在 agent 上執行時報一連串 `Unexpected token '}'`、`Missing closing ')'`，錯誤訊息裡的中文是亂碼。同一支腳本在 PowerShell 7 上正常。
+- **症狀**：repo 裡的 `.ps1` 在 agent 上執行時報一連串 `Unexpected token '}'`、`Missing closing ')'`，錯誤訊息裡的中文是亂碼。
 - **根因**：Windows PowerShell 5.1 讀取沒有 BOM 的檔案時，用系統 ANSI 字碼頁（繁中 Windows 為 Big5）解讀，UTF-8 的中文位元組被拆錯，吃掉了後面的引號。
 - **解法**：repo 內給 Windows PowerShell 5.1 執行的 `.ps1` 一律存成 **UTF-8 with BOM**，並在檔頭註明。推送前可用 PowerShell 7（官方 tarball 免安裝）以「有 BOM 讀 UTF-8、否則讀 Big5」模擬 5.1 解析，省下一輪建置。yaml 內嵌的 `powershell:` 腳本不受影響。
-- **驗證狀態**：已驗證（以 Big5 模擬讀取重現 16 個解析錯誤，加 BOM 後 0 個；加 BOM 後在 agent 上的實際結果尚待確認）
+- **驗證狀態**：部分驗證（根因：本機以 Big5 模擬讀取重現 16 個解析錯誤，加 BOM 後 0 個；修法：加 BOM 後尚未在 agent 上執行過）
 
 ### 42. PowerShell 在 ErrorActionPreference=Stop 時，原生程式寫 stderr 就中止
 
 - **症狀**：腳本呼叫 `ssh.exe` 等原生程式，只是印出一行警告（例如 `Warning: Permanently added ... to the list of known hosts`），整個步驟就以 `NativeCommandError` 失敗。
-- **根因**：Windows PowerShell 5.1 在 `2>&1` 重導或 `$ErrorActionPreference = 'Stop'` 時，把原生程式的 stderr 輸出當成錯誤紀錄處理。
+- **根因**：Windows PowerShell 5.1 在 `2>&1` 重導或 `$ErrorActionPreference = 'Stop'` 時，把原生程式的 stderr 輸出當成錯誤紀錄處理（依 PowerShell 的已知行為判斷，未另做對照實驗）。
 - **解法**：在包裝原生程式的函式內暫時設 `$ErrorActionPreference = 'Continue'`，成敗改看 `$LASTEXITCODE`；ssh 另加 `-o LogLevel=ERROR` 減少雜訊。
 - **驗證狀態**：已遇到（探測 pipeline 的連線本身成功，步驟卻因這行警告失敗）
 
@@ -296,9 +296,9 @@
 
 ### 39. 建立或移動部署分支會立刻觸發一次真正的部署
 
-- **症狀**：pipeline 對某分支（例如測試環境的部署分支）設了自動部署；用 REST 建立該分支或把它移到新 commit，就立刻排入一次預設參數的建置——預設就是正式部署，而你只是想先跑 dry-run。
+- **症狀**：pipeline 對某分支（例如測試環境的部署分支）設了自動部署；用 REST 建立該分支或把它移到新 commit，就立刻排入預設參數的建置（每條設了自動觸發的 pipeline 各一次）——預設就是正式部署，而你只是想先跑 dry-run。
 - **根因**：建立／更新 ref 等同推送，會觸發 CI。
-- **解法**：先撤銷 pipeline 對部署金鑰（secure file）的授權 → 建立或移動分支 → 自動觸發的那次會卡在等授權（或在下載金鑰時失敗），把它取消 → 恢復授權 → 手動以 dry-run 參數執行。撤銷與恢復都要讀回確認。詳見 `cd-ssh-vm.md`。
+- **解法**：先撤銷 pipeline 對部署金鑰（secure file）的授權 → 建立或移動分支 → 自動觸發的建置立刻取消（〔推測〕即使沒取消到，也會卡在等授權或在下載金鑰時失敗，到不了部署步驟；實例都在部署前取消，沒有觀察到這一段） → 恢復授權 → 手動以 dry-run 參數執行。撤銷與恢復都要讀回確認。詳見 `cd-ssh-vm.md`。
 - **驗證狀態**：已遇到（三次建立／移動分支，自動觸發的建置都在部署前取消，部署 stage 為 skipped）
 
 ## 同步與操作環境
@@ -334,6 +334,6 @@
 ### 43. Wiki 改既有頁面不帶 If-Match，server 回 500
 
 - **症狀**：`PUT _apis/wiki/wikis/<id>/pages?path=...` 新建頁面回 201，但同一個請求拿來改既有頁面回 500。
-- **根因**：改既有頁面必須帶 `If-Match: <ETag>`。官方文件說缺少時回 412，這台 server 實際回 500，錯誤訊息看不出原因。
+- **根因**：改既有頁面必須帶 `If-Match: <ETag>`。〔未查證來源〕一般預期缺少時回 412，這台 server 實際回 500，錯誤訊息看不出原因。
 - **解法**：先 `GET` 該頁、從回應標頭取 `ETag`，再帶 `If-Match` 送 `PUT`（回 200）。
 - **驗證狀態**：已驗證（同一內容不帶 If-Match 回 500、帶了回 200）

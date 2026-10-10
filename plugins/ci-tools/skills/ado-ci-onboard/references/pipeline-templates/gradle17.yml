@@ -6,7 +6,7 @@
 #           其中 dependencyRepos 以 ${{ each }} 產生 checkout 步驟的寫法，真實專案是寫死的，參數化版本未驗證。
 #           另一個真實專案（Gradle 7.5.1、主 repo＋1 個依賴 repo）以同結構跑綠，並驗證了：
 #             - emptyRecentTests: buildOnly（測試多年沒動，沒有近期測試時只建置；連線與離線各一次）
-#             - 近期測試掃描涵蓋依賴 repo
+#             （近期測試掃描涵蓋依賴 repo 的寫法：實際專案兩個 repo 的清單都是空的，沒有正對照，未驗證）
 #             - publishArtifact：以 PublishBuildArtifacts 交給下一個 stage（Server 版不支援 Pipeline Artifacts，踩坑 37）
 #           這些段落在本範本中的參數化寫法同樣未在 ADO 重跑。
 #           第一次套用後，請照 SKILL.md 第 5 章用 REST API 確認 timeline、log、測試統計。
@@ -160,7 +160,7 @@ jobs:
           $since = '${{ parameters.recentTestDays }} days ago'
           # 本 repo 與所有依賴 repo 都要掃，否則依賴 repo 裡新改的測試永遠不會被選中（踩坑 12）。
           # 它們都並排 checkout 在 $(Pipeline.Workspace)/s 底下，直接掃那裡的 git 目錄
-          # （範本的 each 指令不能用在 script 字串裡，所以不從 dependencyRepos 參數展開；script 內也不能出現範本運算式的寫法，連註解都不行）
+          # （範本的 each 指令不能用在 script 字串裡，所以不從 dependencyRepos 參數展開；script 內除了 parameters.x 這類單純取值，不要寫其他範本指令，連註解都不行）
           $dirs = @(Get-ChildItem '$(Pipeline.Workspace)/s' -Directory | Where-Object { Test-Path (Join-Path $_.FullName '.git') } | ForEach-Object { $_.FullName })
           Write-Host "掃描的 repo：$($dirs -join ', ')"
           $classes = @()

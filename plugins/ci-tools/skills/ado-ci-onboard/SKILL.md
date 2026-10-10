@@ -24,7 +24,7 @@ description: 引導把自架 Azure DevOps Server（ADO）接上既有 Gitea 專�
 
 | 範本 | 狀態 |
 |------|------|
-| `pipeline-templates/gradle17.yml` | 結構（`jobs`＋`timeoutInMinutes`、指定 Gradle task、依賴 repo 並排 checkout、離線建置、近期測試篩選、init script）已在兩個真實專案跑到綠燈（Gradle 8.14.3 與 7.5.1，各為主 repo＋1 個依賴 repo）；第三個專案另外驗證了「沒有近期測試就只建置」（`emptyRecentTests: buildOnly`，連線與離線各一次）與 Build Artifacts 發佈。本檔是去識別化並參數化的改寫版，**改寫後未在 ADO 重新執行**。其中 `dependencyRepos` 以 `${{ each }}` 產生 checkout 的寫法**未驗證**（真實專案是寫死的） |
+| `pipeline-templates/gradle17.yml` | 結構（`jobs`＋`timeoutInMinutes`、指定 Gradle task、依賴 repo 並排 checkout、離線建置、近期測試篩選、init script）已在第二個真實專案（Gradle 8.14.3、主 repo＋1 個依賴 repo）跑到綠燈；第三個專案（Gradle 7.5.1）以**寫死的同類 yaml**（非本範本）驗證了依賴 repo 並排 checkout、離線建置、「沒有近期測試就只建置」（連線與離線各一次）與 Build Artifacts 發佈，但走的是只建置模式，**沒有執行到近期測試篩選與 init script**。本檔是去識別化並參數化的改寫版，**改寫後未在 ADO 重新執行**。其中 `dependencyRepos` 以 `${{ each }}` 產生 checkout 的寫法**未驗證**（真實專案是寫死的） |
 | `cd-templates/probe-agent-ssh.yml` | 已在實際專案跑過（確認 agent 能 TCP 連到 VM 並完成 SSH 握手、列出 agent 上可用的工具） |
 | `cd-templates/deploy-vm.ps1`、`cd-stage-snippet.yml`、`push-deploy-branch.sh` | **未驗證**：結構來自實際專案的 CD，但該專案尚未完成 dry-run 與正式部署（見 `cd-ssh-vm.md`） |
 | `pipeline-templates/maven8.yml` | **未驗證** |
@@ -333,7 +333,7 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 2. **部署分支只建在 ADO**：Gitea 只能經 VPN、不設 push mirror 時，觸發點只能在 ADO。要部署時把 commit 推到 ADO 的部署分支；`cd-templates/push-deploy-branch.sh` 會檢查本機沒有未推上 Gitea 的 commit，再依序快轉依賴 repo、主 repo，最後移動部署分支。
 3. **金鑰**：CD 專用金鑰（不重用個人金鑰），私鑰上傳為 secure file（權杖要 Secure Files 範圍）並授權 pipeline；VM 主機金鑰以檔案釘選，`StrictHostKeyChecking=yes`。
 4. **pipeline 兩個 stage**：Build 照舊，部署分支才發佈產物（**Build Artifacts**，Server 版不支援 Pipeline Artifacts，踩坑 37）；Deploy stage 只在部署分支執行，提供 dry-run 參數。
-5. **建立／移動部署分支會立刻觸發真部署**（踩坑 39）：先用 `ado-authorize.sh revoke --securefile <名稱>` 撤銷授權 → 移動分支 → 取消自動觸發的建置 → 恢復授權 → 手動以 dry-run 執行。
+5. **建立／移動部署分支會立刻觸發真部署**（踩坑 39）：先用 `ado-authorize.sh revoke --securefile <名稱> --pipelines <id>` 撤銷授權 → 移動分支 → 取消自動觸發的建置 → 恢復授權 → 手動以 dry-run 執行。
 6. **PowerShell 5.1**：`.ps1` 存 UTF-8 with BOM（踩坑 41）、包裝原生程式時暫改 `ErrorActionPreference`（踩坑 42）；推送前用 PowerShell 7 模擬 5.1 讀檔做解析檢查。
 
 ---

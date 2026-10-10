@@ -4,7 +4,7 @@
 # 為什麼需要：新專案的 pipeline 第一次使用 agent 佇列、引用別的 repo、或下載 secure file 時，
 # 都要先授權，否則建置一直停在 notStarted、agent 卻閒置（見 pitfalls.md 第 35 條「新專案的 pipeline 一直停在 notStarted，agent 卻閒著」）。網頁上是執行頁的「Permit」按鈕。
 # 另一個用途：建立或移動「會觸發部署」的分支前，先撤銷 pipeline 對部署金鑰（secure file）的授權，
-# 讓自動觸發的那次卡住、取消後再恢復（cd-ssh-vm.md）。
+# 取消自動觸發的那次後再恢復；〔推測〕沒取消到也會卡在等授權（cd-ssh-vm.md）。
 #
 # grant／revoke 會寫入 ADO，寫完一定讀回比對，不一致就以非 0 結束。list 只發 GET。
 # 權杖只從環境變數讀（servers.yml 的 pat_env），以 curl 設定檔從 stdin 傳入，不出現在指令列，也不會印出。
