@@ -1,7 +1,7 @@
 # CD stage 片段：只在 ADO 的部署分支（例：SIT）執行，把 Build stage 產出的產物部署到 VM（cd-ssh-vm.md 第 4 步）
 #
-# 驗證狀態：未驗證。結構來自一個實際專案；其中 Build Artifacts 傳遞產物已在該專案實跑成功；DownloadSecureFile 步驟執行成功（金鑰內容是否可用要等部署步驟跑通才算確認），
-#           但部署步驟（deploy-vm.ps1）尚未有一次成功的 dry-run，也未正式部署。本檔另經去識別化改寫。
+# 驗證狀態：未驗證（本檔為去識別化改寫版）。結構來源的實際專案中，Build Artifacts 傳遞產物、DownloadSecureFile、部署步驟
+#           都已實跑成功（dry-run 與正式部署）；改寫後的本檔未在 ADO 執行過。
 #
 # 套用方式：
 #   - 主 pipeline 改成 stages（Build ＋ 本檔的 Deploy），trigger 加上部署分支

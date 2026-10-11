@@ -1,7 +1,7 @@
 # CD：從自架 ADO agent 經 SSH 部署到 VM
 
 本文件來自一個 Tomcat＋war 的實際專案：在 CI（第 4、5 章）跑通之後，再加上「推 ADO 的部署分支 → 自動部署到測試 VM」。
-範本放在 `cd-templates/`。**整體 CD 流程的驗證狀態見最後一節，大部分仍是未驗證**，套用時請照實告知使用者。
+範本放在 `cd-templates/`。**整體 CD 流程的驗證狀態見最後一節**：來源專案的實作已跑通 dry-run 與正式部署，但本目錄的範本是去識別化改寫版、沒有在 ADO 執行過，套用時請照實告知使用者。
 
 ## 適用條件
 
@@ -133,5 +133,6 @@ agent 的 PowerShell task 預設用 Windows PowerShell 5.1：
 | 連線探測 pipeline（`probe-agent-ssh.yml`） | **已在實際專案跑過**：TCP 22 與 SSH 握手確認可達；本檔為去識別化版 |
 | Build Artifacts 傳遞產物（Server 版不支援 Pipeline Artifacts） | **已驗證**：Pipeline Artifacts 實跑報錯，改 Build Artifacts 後 war 成功傳到 Deploy stage |
 | secure file 上傳、授權、撤銷授權技巧 | 已遇到：實際專案操作成功，取消的建置部署 stage 為 skipped |
-| `deploy-vm.ps1` 與整體 CD | **未驗證**：實際專案的 dry-run 第一次因 Pipeline Artifacts、第二次因 `.ps1` 沒有 BOM 失敗；修正版 dry-run 尚未跑、也未正式部署。本骨架另經去識別化改寫，同樣未在 ADO 執行過 |
-| `push-deploy-branch.sh` | 未驗證：實際專案的版本只跑過預覽與「本機有未推送 commit 時中止」，未以 `--apply` 實際推送；本檔為參數化改寫 |
+| 來源專案的整體 CD（agent 端 ps1＋遠端腳本） | **已在實際專案跑通**：dry-run 前兩次分別因 Pipeline Artifacts、`.ps1` 沒有 BOM 失敗，修正後通過；之後兩個 repo（依賴順序：先被依賴的服務）各正式部署成功一次，VM 端另行確認新 JVM 啟動、HTTP 200、另一個服務未受影響。上傳過慢的問題見踩坑 44 |
+| `deploy-vm.ps1` 骨架 | **未驗證**：由上述已跑通的實作去識別化、參數化改寫，改寫後的本檔未在 ADO 執行過 |
+| `push-deploy-branch.sh` | 未驗證：實際專案的版本只跑過預覽與「本機有未推送 commit 時中止」，未以 `--apply` 實際推送（該專案的正式部署是以 REST 直接移動部署分支觸發）；本檔為參數化改寫 |

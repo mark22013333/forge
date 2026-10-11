@@ -26,7 +26,7 @@ description: 引導把自架 Azure DevOps Server（ADO）接上既有 Gitea 專�
 |------|------|
 | `pipeline-templates/gradle17.yml` | 結構（`jobs`＋`timeoutInMinutes`、指定 Gradle task、依賴 repo 並排 checkout、離線建置、近期測試篩選、init script）已在第二個真實專案（Gradle 8.14.3、主 repo＋1 個依賴 repo）跑到綠燈；第三個專案（Gradle 7.5.1）以**寫死的同類 yaml**（非本範本）驗證了依賴 repo 並排 checkout、離線建置、「沒有近期測試就只建置」（連線與離線各一次）與 Build Artifacts 發佈，但走的是只建置模式，**沒有執行到近期測試篩選與 init script**。本檔是去識別化並參數化的改寫版，**改寫後未在 ADO 重新執行**。其中 `dependencyRepos` 以 `${{ each }}` 產生 checkout 的寫法**未驗證**（真實專案是寫死的） |
 | `cd-templates/probe-agent-ssh.yml` | 已在實際專案跑過（確認 agent 能 TCP 連到 VM 並完成 SSH 握手、列出 agent 上可用的工具） |
-| `cd-templates/deploy-vm.ps1`、`cd-stage-snippet.yml`、`push-deploy-branch.sh` | **未驗證**：結構來自實際專案的 CD，但該專案尚未完成 dry-run 與正式部署（見 `cd-ssh-vm.md`） |
+| `cd-templates/deploy-vm.ps1`、`cd-stage-snippet.yml`、`push-deploy-branch.sh` | **未驗證**：來源專案的 CD 實作已跑通 dry-run 與正式部署，但這三個檔是去識別化改寫版，改寫後未執行過；`push-deploy-branch.sh` 的 `--apply` 連來源版本都沒用過（見 `cd-ssh-vm.md`） |
 | `pipeline-templates/maven8.yml` | **未驗證** |
 | `pipeline-templates/maven25.yml` | **未驗證** |
 | `pipeline-templates/vue.yml` | **未驗證** |
@@ -327,7 +327,7 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 
 ## 9. CD：從 agent 經 SSH 部署到 VM
 
-完整做法見 `references/cd-ssh-vm.md`，範本在 `references/cd-templates/`。**整體流程與 `deploy-vm.ps1` 目前未驗證**（來源專案尚未完成 dry-run 與正式部署），套用時照實告知使用者。摘要：
+完整做法見 `references/cd-ssh-vm.md`，範本在 `references/cd-templates/`。**來源專案的整體流程已跑通 dry-run 與正式部署；`deploy-vm.ps1` 等範本是改寫版、未驗證**，套用時照實告知使用者。摘要：
 
 1. **先探測再設計**：用 `cd-templates/probe-agent-ssh.yml` 建臨時 pipeline，確認 agent 能 TCP 連到 VM、完成 SSH 握手，並列出 agent 上的工具。自架 Windows agent 的 MinGit 沒有 bash（踩坑 40），部署邏輯要用 PowerShell 5.1＋Windows 內建 OpenSSH。探測完刪掉臨時 repo 與自動建立的 pipeline（踩坑 36）。
 2. **部署分支只建在 ADO**：Gitea 只能經 VPN、不設 push mirror 時，觸發點只能在 ADO。要部署時把 commit 推到 ADO 的部署分支；`cd-templates/push-deploy-branch.sh` 會檢查本機沒有未推上 Gitea 的 commit，再依序快轉依賴 repo、主 repo，最後移動部署分支。

@@ -1,7 +1,7 @@
 ﻿# CD：自架 Windows agent 經 SSH 把產物部署到 Linux VM（cd-ssh-vm.md）
 #
-# 驗證狀態：未驗證。由一個 Tomcat＋war 實際專案的部署腳本去識別化、參數化而來；該專案的 dry-run 尚未成功過、也未正式部署，
-#           本骨架本身也沒有在 ADO 執行過。第一次套用請先以 -DryRun 跑，並照 SKILL.md 第 5 章用 REST API 看 log。
+# 驗證狀態：未驗證。由一個 Tomcat＋war 實際專案的部署腳本去識別化、參數化而來；該專案的原始腳本已跑通 dry-run 與正式部署，
+#           但本骨架（改寫後）沒有在 ADO 執行過。第一次套用請先以 -DryRun 跑，並照 SKILL.md 第 5 章用 REST API 看 log。
 #
 # 本檔只負責 agent 端：預檢、（可選）產物比對、分段上傳＋sha256 驗證、上傳遠端腳本、在 VM 以 setsid nohup 背景執行並追蹤結果。
 # VM 上的停止、備份、切換、健康檢查、回滾由專案的遠端腳本負責，契約見 cd-ssh-vm.md「遠端腳本契約」：
