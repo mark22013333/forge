@@ -1,8 +1,8 @@
 # 踩坑表：自架 Azure DevOps Server 導入 CI
 
-這 33 條都是實際導入時遇到的問題，不是從文件整理來的。每條都列症狀、根因、解法、驗證狀態。
+這 44 條都是實際導入時遇到的問題，不是從文件整理來的。每條都列症狀、根因、解法、驗證狀態。
 
-第 1～24 條來自第一個導入的專案；第 25～33 條來自第二個專案（Gradle 8.14.3、主 repo＋依賴 repo，接在已經裝好的同一台 server 上）。
+第 1～24 條來自第一個導入的專案；第 25～33 條來自第二個專案（Gradle 8.14.3、主 repo＋依賴 repo，接在已經裝好的同一台 server 上）；第 34～44 條來自第三個專案（Gradle 7.5.1、主 repo＋依賴 repo，另有一個獨立 repo，接在同一台 server 上，並做了從 Windows agent 經 SSH 部署到 Linux VM 的 CD）。
 
 ## 驗證狀態的意思
 
@@ -85,8 +85,23 @@
 
 - **症狀**：同一個權杖查詢專案、建置都正常，但建專案、推送、排入建置時回 401。
 - **根因**：權杖只有讀取範圍。各動作需要的範圍見 SKILL.md「權杖（PAT）與權限範圍」：建專案要 Project and Team（讀寫管理）、建 repo 與推送要 Code（讀寫）、建 pipeline 定義與排入建置要 Build（讀取與執行）。
+- **第三個專案的實例**：同一個權杖能建專案、建 repo、改預設分支，但排入建置回 401，補上 **Build：讀取與執行**後正常；查詢 secure file 清單回 200、上傳卻回 401，補上 **Secure Files：讀取、建立及管理**後正常。「查得到、寫不進」就是範圍問題的典型樣子。
 - **解法**：換用有對應範圍的權杖（servers.yml 的 `pat_env` 指向它），或改用網頁操作。401 還有另一個常見原因是 IIS 基本驗證（第 5 條）：所有權杖、連讀取都 401 時先查第 5 條；只有寫入 401 時查範圍。
 - **驗證狀態**：已遇到（唯讀權杖讀取正常、寫入 401；「各動作對應哪個範圍」是依官方範圍名稱整理，未逐一做對照實驗）
+
+### 34. 用 REST 建 pipeline 回 401，但 pipeline 其實已經建好
+
+- **症狀**：`POST _apis/pipelines` 回 401（或回應不是 JSON），看起來像建立失敗。
+- **根因**：權杖缺 Build：讀取與執行時，定義本身已建立，401 來自建立之後的後續動作（推測，未查證是哪一步）。
+- **解法**：**不要直接重送**，先 `GET _apis/pipelines` 列出確認；已存在就讀回它的 `configuration` 檢查 yaml 路徑與 repo id。〔推測〕重送可能建出名稱重複的第二條（未實測）。
+- **驗證狀態**：已遇到（兩條 pipeline 都出現同樣情況，列表確認皆已建成；根因未做對照實驗）
+
+### 35. 新專案的 pipeline 一直停在 notStarted，agent 卻閒著
+
+- **症狀**：手動觸發成功（HTTP 200、拿到 run id），但建置永遠 `notStarted`；agent 在線且閒置，agent pool 的排隊清單裡也看不到這個工作。
+- **根因**：新專案的 pipeline 還沒被授權使用資源：agent 佇列（`queue`）、yaml 裡 `resources.repositories` 引用的其他 repo（`repository`，id 為 `<專案 id>.<repo id>`）、`DownloadSecureFile` 用到的 secure file（`securefile`）。網頁上會出現「需要權限」的 Permit 按鈕，REST 觸發時看不到。
+- **解法**：`GET _apis/pipelines/pipelinePermissions/<type>/<id>?api-version=6.1-preview.1` 看授權清單（空的就是原因），`PATCH` 同一路徑、body `{"pipelines":[{"id":<pipeline id>,"authorized":true}]}`，再讀回確認。可用 `scripts/ado-authorize.sh`。
+- **驗證狀態**：已驗證（授權清單為空 → PATCH 後同一次建置隨即開始執行）
 
 ## Agent 與建置環境
 
@@ -118,6 +133,34 @@
 - **解法**：同一台機器多裝幾個 agent，各自使用不同的資料夾與名稱。記憶體以每個建置 6～8GB 粗估，先開 3～4 個再觀察。會改資料的 E2E（例如 Playwright）不可並行，要放獨立的 pool，或用 `lockBehavior: sequential`。
 - **驗證狀態**：**估計**（6～8GB 是推估值，沒有量測過）。兩個 agent 並行有實際重疊 5 分鐘且都成功，但這不是完整的壓力測試。
 
+### 40. agent 內附的 git 是 MinGit，沒有 bash 與常用工具
+
+- **症狀**：想在 pipeline 裡直接跑既有的 bash 部署腳本，但 agent 上找不到 bash。
+- **根因**：agent 的 `externals\git` 是精簡版 MinGit：有 `ssh.exe`、`awk`、`sed`、`mktemp`，**沒有** `bash.exe`、`scp`、`unzip`、`sha256sum`、`stat`、`dd`。
+- **解法**：Windows agent 上的部署邏輯改用 PowerShell 5.1，連線用 Windows 內建的 `C:\Windows\System32\OpenSSH\ssh.exe`／`scp.exe`；需要在目標機執行的部分仍可用 bash（把腳本 scp 過去再執行）。見 `cd-ssh-vm.md`。
+- **驗證狀態**：已驗證（以探測 pipeline 逐一檢查工具是否存在）
+
+### 41. Windows PowerShell 5.1 讀無 BOM 的 .ps1，中文變亂碼、整支腳本無法解析
+
+- **症狀**：repo 裡的 `.ps1` 在 agent 上執行時報一連串 `Unexpected token '}'`、`Missing closing ')'`，錯誤訊息裡的中文是亂碼。
+- **根因**：Windows PowerShell 5.1 讀取沒有 BOM 的檔案時，用系統 ANSI 字碼頁（繁中 Windows 為 Big5）解讀，UTF-8 的中文位元組被拆錯，吃掉了後面的引號。
+- **解法**：repo 內給 Windows PowerShell 5.1 執行的 `.ps1` 一律存成 **UTF-8 with BOM**，並在檔頭註明。推送前可用 PowerShell 7（官方 tarball 免安裝）以「有 BOM 讀 UTF-8、否則讀 Big5」模擬 5.1 解析，省下一輪建置。yaml 內嵌的 `powershell:` 腳本不受影響。
+- **驗證狀態**：部分驗證（根因：本機以 Big5 模擬讀取重現 16 個解析錯誤，加 BOM 後 0 個；修法：加 BOM 後尚未在 agent 上執行過）
+
+### 42. PowerShell 在 ErrorActionPreference=Stop 時，原生程式寫 stderr 就中止
+
+- **症狀**：腳本呼叫 `ssh.exe` 等原生程式，只是印出一行警告（例如 `Warning: Permanently added ... to the list of known hosts`），整個步驟就以 `NativeCommandError` 失敗。
+- **根因**：Windows PowerShell 5.1 在 `2>&1` 重導或 `$ErrorActionPreference = 'Stop'` 時，把原生程式的 stderr 輸出當成錯誤紀錄處理（依 PowerShell 的已知行為判斷，未另做對照實驗）。
+- **解法**：在包裝原生程式的函式內暫時設 `$ErrorActionPreference = 'Continue'`，成敗改看 `$LASTEXITCODE`；ssh 另加 `-o LogLevel=ERROR` 減少雜訊。
+- **驗證狀態**：已遇到（探測 pipeline 的連線本身成功，步驟卻因這行警告失敗）
+
+### 44. Windows 版 OpenSSH 8.1 設了 ConnectTimeout，每次連線都等滿逾時
+
+- **症狀**：agent 上每一次 `ssh`／`scp` 都固定多花好幾秒，而且秒數非常一致；分段上傳時每段固定多出約 2×ConnectTimeout，整體上傳慢十倍以上，最後撞到 job 逾時被取消。
+- **根因**：Windows 內建的 `OpenSSH_for_Windows_8.1p1` 在設了 `ConnectTimeout` 時，連線會等滿這個秒數才回報成功（`ssh -v` 可看到 `Connecting to ...` 與 `Connection established` 之間剛好隔 ConnectTimeout 秒）。網路本身沒問題：同一台 agent 用 .NET 直接建 TCP 連線只要 0.05 秒。
+- **解法**：agent 端的 ssh／scp **不要設 `ConnectTimeout`**；需要逾時保護時在外層做（例如分段上傳每段以 `Start-Process` 啟動、逾時就 `taskkill /T`）。排查時先用探測 pipeline 量「ssh true」的耗時，與 .NET TcpClient 的連線時間對照。
+- **驗證狀態**：已驗證（同一台 agent 上 `ssh true`：ConnectTimeout=5／30／不設 → 5.6／30.6／0.7 秒，各兩次一致；不設時 scp 3MB 約 1.5 秒）
+
 ## 測試執行
 
 ### 9. 測試需要環境變數與設定檔
@@ -145,8 +188,11 @@
 
 - **症狀**：整套測試太久，或有大量整合測試在 CI 上跑不起來。
 - **根因**：無（這是策略，不是故障）。
-- **解法**：checkout 設 `fetchDepth: 0`。用 PowerShell 呼叫 agent 內附的 git（第 6 條），列出 `--since="N days ago"` 內修改過的測試類別，寫成清單檔，再交給 init script 做 `includeTestsMatching`。**清單為空時必須讓建置失敗**，避免「零測試、建置通過」的假綠燈。
-- **驗證狀態**：已遇到
+- **解法**：checkout 設 `fetchDepth: 0`。用 PowerShell 呼叫 agent 內附的 git（第 6 條），列出 `--since="N days ago"` 內修改過的測試類別，寫成清單檔，再交給 init script 做 `includeTestsMatching`。有依賴 repo 時，**掃描要涵蓋依賴 repo 的 checkout 目錄**，否則依賴 repo 裡新改的測試永遠不會被選中。
+- **清單為空時的兩種策略**（範本參數 `emptyRecentTests`）：
+  - `fail`（預設）：讓建置失敗，避免「零測試、建置通過」的假綠燈。適合測試持續有人維護的專案。
+  - `buildOnly`：**明確切換成只建置**（例：`assemble testClasses`），log 寫明「本次不跑測試」，不載入 init script、不發佈測試結果。適合測試多年沒動的專案：第三個專案的測試最後修改都在 180 天以前，用 `fail` 會每次建置都紅。init script 仍然拒絕空清單，兩種策略都不會產生假的「測試通過」。
+- **驗證狀態**：已遇到（`buildOnly` 在第三個專案以同結構的專案檔跑綠，連線與離線各一次）
 
 ### 13. 依賴版本被釘在舊版的測試引擎衝突
 
@@ -234,6 +280,34 @@
 - **解法**：急著驗證時直接手動排入建置（網頁 Run，或有 Build 執行權限的權杖呼叫 REST API），不要等觸發。
 - **驗證狀態**：**未釐清**（單次觀察；延遲時間是觀察值，原因與重現條件都未查）
 
+### 36. 推含 azure-pipelines.yml 的新 repo，ADO 會自動建一條 pipeline
+
+- **症狀**：只是推了一個含 `azure-pipelines.yml` 的 repo（例如臨時探測用），pipeline 清單多出一條 `<repo 名稱> CI`。
+- **根因**：ADO 偵測到新 repo 的預設分支有 yaml，自動建立 pipeline 定義。
+- **解法**：刪臨時 repo 時一併刪掉這條自動建立的定義（`DELETE _apis/build/definitions/<id>`）；正式 repo 則注意不要因此出現兩條指向同一個 yaml 的 pipeline。
+- **驗證狀態**：已遇到
+
+### 37. Server 版不支援 Pipeline Artifacts
+
+- **症狀**：`PublishPipelineArtifact@1` 執行時報「內部部署不支援管線成品工作。請改用組建成品工作。」。這個 task 在 server 的 task 清單裡**查得到**，只有執行時才失敗。
+- **根因**：Pipeline Artifacts 只有雲端版 Azure DevOps Services 支援。
+- **解法**：stage 之間傳檔改用 `PublishBuildArtifacts@1`（`PathtoPublish`、`ArtifactName`、`publishLocation: Container`）與 `DownloadBuildArtifacts@1`（`buildType: current`、`downloadType: single`、`artifactName`、`downloadPath`；檔案會放在 `<downloadPath>\<artifactName>\`）。
+- **驗證狀態**：已驗證（改用 Build Artifacts 後，下一個 stage 成功取得檔案）
+
+### 38. Gradle 版本已在快取清單內，離線建置仍缺套件
+
+- **症狀**：專案的 Gradle 版本已列在 `cached_gradle_versions`，第一次離線建置仍報 `No cached version of <套件> available for offline mode`。
+- **根因**：第 25 條處理的是「Gradle 版本」層級；但**各專案自己的依賴**（外掛、函式庫）不一定被同一台 agent 下載過。同版本的其他專案建置過，不代表這個專案的套件都在快取裡。
+- **解法**：新專案第一次建置一律連線跑：網頁取消勾選 offline，或 REST 觸發時帶 `templateParameters: {"offline":"false"}`（`scripts/ado-run.sh -p offline=false`）。成功後再用預設的離線模式跑一次，確認之後不用連線也能建置。
+- **驗證狀態**：已遇到（兩個 repo 都是離線失敗 → 連線成功 → 離線成功）
+
+### 39. 建立或移動部署分支會立刻觸發一次真正的部署
+
+- **症狀**：pipeline 對某分支（例如測試環境的部署分支）設了自動部署；用 REST 建立該分支或把它移到新 commit，就立刻排入預設參數的建置（每條設了自動觸發的 pipeline 各一次）——預設就是正式部署，而你只是想先跑 dry-run。
+- **根因**：建立／更新 ref 等同推送，會觸發 CI。
+- **解法**：先撤銷 pipeline 對部署金鑰（secure file）的授權 → 建立或移動分支 → 自動觸發的建置立刻取消（〔推測〕即使沒取消到，也會卡在等授權或在下載金鑰時失敗，到不了部署步驟；實例都在部署前取消，沒有觀察到這一段） → 恢復授權 → 手動以 dry-run 參數執行。撤銷與恢復都要讀回確認。詳見 `cd-ssh-vm.md`。
+- **驗證狀態**：已遇到（三次建立／移動分支，自動觸發的建置都在部署前取消，部署 stage 為 skipped）
+
 ## 同步與操作環境
 
 ### 16. macOS 會清掉 `/tmp` 裡久未存取的檔案
@@ -263,3 +337,10 @@
 - **根因**：主機名是人取的，跟實際跑的軟體沒有關係。
 - **解法**：看 API 回應判斷：`curl <主機>/api/v1/version`，Gitea 會回 `{"version":"..."}`，需要登入時也會回 JSON 訊息；`curl <主機>/api/v4/version`，GitLab 回 JSON（未登入是 401 JSON）。`ci-discover.sh` 已照這個順序判斷。
 - **驗證狀態**：已遇到
+
+### 43. Wiki 改既有頁面不帶 If-Match，server 回 500
+
+- **症狀**：`PUT _apis/wiki/wikis/<id>/pages?path=...` 新建頁面回 201，但同一個請求拿來改既有頁面回 500。
+- **根因**：改既有頁面必須帶 `If-Match: <ETag>`。〔未查證來源〕一般預期缺少時回 412，這台 server 實際回 500，錯誤訊息看不出原因。
+- **解法**：先 `GET` 該頁、從回應標頭取 `ETag`，再帶 `If-Match` 送 `PUT`（回 200）。
+- **驗證狀態**：已驗證（同一內容不帶 If-Match 回 500、帶了回 200）

@@ -1,13 +1,13 @@
 ---
 name: ado-ci-onboard
-description: 引導把自架 Azure DevOps Server（ADO）接上既有 Gitea 專案的 CI：先探索既有設定、評估與安裝 Server 與 agent、建立 ADO 專案與 repo、套 pipeline 範本、以 REST API 驗證建置、首次建置失敗分類、Gitea → ADO 單向同步（含多 repo）、測試分層。當使用者提到「ado-ci-onboard」、「導入 CI」、「自架 Azure DevOps」、「ADO Server」、「Gitea 同步到 ADO」、「pipeline 範本」、「CI 踩坑」時觸發此 Skill。
+description: 引導把自架 Azure DevOps Server（ADO）接上既有 Gitea 專案的 CI：先探索既有設定、評估與安裝 Server 與 agent、建立 ADO 專案與 repo、套 pipeline 範本、以 REST API 驗證建置、首次建置失敗分類、Gitea → ADO 單向同步（含多 repo）、測試分層，以及從 Windows agent 經 SSH 部署到 VM 的 CD。當使用者提到「ado-ci-onboard」、「導入 CI」、「自架 Azure DevOps」、「ADO Server」、「Gitea 同步到 ADO」、「pipeline 範本」、「CI 踩坑」、「ADO 部署到 VM」、「ADO CD」時觸發此 Skill。
 ---
 
 # ADO CI Onboard — 自架 Azure DevOps Server 導入 CI
 
 把既有 Gitea 專案接上自架 Azure DevOps Server（以下簡稱 ADO）的 CI。Gitea 仍是主要 repo，ADO 只當 CI 鏡像。
 
-本 skill 的內容來自兩次實際導入：第一次從零安裝 Server，第二次接在已經裝好的同一台 Server 上（Gradle 8.14.3、主 repo＋依賴 repo）。踩過的坑整理在 `references/pitfalls.md`，每條都有驗證狀態。
+本 skill 的內容來自三次實際導入：第一次從零安裝 Server，第二次接在已經裝好的同一台 Server 上（Gradle 8.14.3、主 repo＋依賴 repo），第三次也接在同一台 Server 上（Gradle 7.5.1、主 repo＋依賴 repo＋另一個獨立 repo），並做了從 Windows agent 經 SSH 部署到 Linux VM 的 CD（第 9 章）。踩過的坑整理在 `references/pitfalls.md`，每條都有驗證狀態。
 
 ---
 
@@ -24,7 +24,9 @@ description: 引導把自架 Azure DevOps Server（ADO）接上既有 Gitea 專�
 
 | 範本 | 狀態 |
 |------|------|
-| `pipeline-templates/gradle17.yml` | 結構（`jobs`＋`timeoutInMinutes`、指定 Gradle task、依賴 repo 並排 checkout、離線建置、近期測試篩選、init script）已在一個真實專案（Gradle 8.14.3、主 repo＋1 個依賴 repo）跑到綠燈；本檔是去識別化並參數化的改寫版，**改寫後未在 ADO 重新執行**。其中 `dependencyRepos` 以 `${{ each }}` 產生 checkout 的寫法**未驗證**（真實專案是寫死的） |
+| `pipeline-templates/gradle17.yml` | 結構（`jobs`＋`timeoutInMinutes`、指定 Gradle task、依賴 repo 並排 checkout、離線建置、近期測試篩選、init script）已在第二個真實專案（Gradle 8.14.3、主 repo＋1 個依賴 repo）跑到綠燈；第三個專案（Gradle 7.5.1）以**寫死的同類 yaml**（非本範本）驗證了依賴 repo 並排 checkout、離線建置、「沒有近期測試就只建置」（連線與離線各一次）與 Build Artifacts 發佈，但走的是只建置模式，**沒有執行到近期測試篩選與 init script**。本檔是去識別化並參數化的改寫版，**改寫後未在 ADO 重新執行**。其中 `dependencyRepos` 以 `${{ each }}` 產生 checkout 的寫法**未驗證**（真實專案是寫死的） |
+| `cd-templates/probe-agent-ssh.yml` | 已在實際專案跑過（確認 agent 能 TCP 連到 VM 並完成 SSH 握手、列出 agent 上可用的工具） |
+| `cd-templates/deploy-vm.ps1`、`cd-stage-snippet.yml`、`push-deploy-branch.sh` | **未驗證**：來源專案的 CD 實作已跑通 dry-run 與正式部署，但這三個檔是去識別化改寫版，改寫後未執行過；`push-deploy-branch.sh` 的 `--apply` 連來源版本都沒用過（見 `cd-ssh-vm.md`） |
 | `pipeline-templates/maven8.yml` | **未驗證** |
 | `pipeline-templates/maven25.yml` | **未驗證** |
 | `pipeline-templates/vue.yml` | **未驗證** |
@@ -57,8 +59,11 @@ server 層的資訊（主機、collection、SSH 金鑰、權杖變數名、agent
 | 建立 ADO 專案 | Project and Team：讀取、寫入與管理 |
 | 建 repo、改名、改預設分支、透過 HTTPS 推送 | Code：讀取與寫入（SSH 推送用金鑰，不用權杖） |
 | 建 pipeline 定義、排入建置 | Build：讀取與執行 |
+| 上傳 secure file（CD 的部署金鑰） | Secure Files：讀取、建立及管理（已遇到：只有讀取時清單查得到、上傳回 401） |
+| 授權 pipeline 使用資源（`pipelinePermissions`，踩坑 35） | **未驗證**是哪個範圍（實測時權杖已含 Build 讀取與執行等多個範圍） |
+| 讀寫 Wiki 頁面 | **未驗證**是哪個範圍（依官方名稱應為 Wiki 讀取與寫入）；改既有頁面要帶 `If-Match`（踩坑 43） |
 
-**401 的判讀**（踩坑 32、5）：
+**401 的判讀**（踩坑 32、5、34）：
 
 - **所有請求都 401**（連查詢都不行）→ 先查 IIS 基本驗證是否停用（踩坑 5）。
 - **查詢正常、只有寫入 401** → 權杖範圍不足（踩坑 32）。換用有對應範圍的權杖（改 `pat_env`），或改走網頁：
@@ -66,6 +71,7 @@ server 層的資訊（主機、collection、SSH 金鑰、權杖變數名、agent
   - 建 repo：專案的 **Repos → New repository**；改預設分支：**Repos → Branches**，在正式分支的選單選 **Set as default branch**
   - 建 pipeline：**Pipelines → New pipeline → Azure Repos Git → Existing Azure Pipelines YAML file**，選分支與 yaml 路徑
   - 執行：**Run pipeline** 時選含 yaml 的分支（踩坑 28）
+- **建立 pipeline 回 401 不代表沒建成**（踩坑 34）：先列出 pipeline 確認，不要重送，否則會建出重複的定義。
 - 權杖的實際範圍也可能比以為的大（踩坑 23，**範圍細節未釐清**），發出前先確認。
 
 範例（bash；權杖以 curl 設定檔從 stdin 傳入，不會出現在指令列或 `ps`）：
@@ -170,13 +176,25 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 4. **立刻改預設分支**：ADO 會把第一個收到的分支當預設，常常變成測試分支（踩坑 18）。`PATCH $ADO/<專案>/_apis/git/repositories/<id>?api-version=6.0`，body `{"defaultBranch": "refs/heads/main"}`。路徑**一定要用 repo 的 id**，用名稱會回 400（踩坑 27）。
 5. 觸發延遲：透過 SSH 推送後，曾觀察到 CI 觸發的建置約 30 分鐘後才出現（踩坑 29，**原因未釐清**）。急著驗證時直接手動執行，不要等。
 
+### 3.3 建 pipeline 與授權資源
+
+1. 用 REST 建 pipeline（`POST $ADO/<專案>/_apis/pipelines?api-version=6.0-preview.1`，`configuration` 指向 repo id 與 yaml 路徑）或走網頁。**回 401 先列出 pipeline 確認**，可能已經建好（踩坑 34）。
+2. **新專案一定要授權**，否則觸發後永遠 `notStarted`（踩坑 35）：agent 佇列、yaml 裡 `resources.repositories` 引用的依賴 repo、CD 用到的 secure file。
+   ```bash
+   "${CLAUDE_PLUGIN_ROOT}/scripts/ado-authorize.sh" list  --queue Default
+   "${CLAUDE_PLUGIN_ROOT}/scripts/ado-authorize.sh" grant --queue Default      --pipelines <id>,<id>
+   "${CLAUDE_PLUGIN_ROOT}/scripts/ado-authorize.sh" grant --repo product-core  --pipelines <id>
+   ```
+   寫入後腳本會讀回比對，不符就失敗。
+3. 推含 yaml 的新 repo（例如臨時探測用）時，ADO 會自動建一條 `<repo> CI`（踩坑 36），清理時一併刪除。
+
 ## 4. 套 pipeline 範本
 
-1. 依專案類型選 `references/pipeline-templates/` 裡的範本，並告知使用者它的驗證狀態（見上方表格）。
+1. **先找同一台 server 上「同建置工具版本、已綠燈」的既有專案 pipeline**（`ci-discover.sh` 會列出其他專案的 `azure-pipelines.yml`，再用第 5 章的 API 確認它最近的建置成功）。有的話以它為底改寫，比通用範本可靠；沒有才依專案類型選 `references/pipeline-templates/` 裡的範本，並告知使用者它的驗證狀態（見上方表格）。
 2. 參數預設值從兩層設定填入：`.ci-tools.yml` 的 `gradle_tasks`、`recent_test_days`、`timeout_minutes`、`offline`，`servers.yml` agent 的 `jdk`、`gradle_user_home`、`npm_cache`。
 3. Gradle 專案：把 `references/ci-init.gradle` 複製到專案的 `ci/ci-init.gradle`，pipeline 以 `--init-script` 載入，**不改專案的 build.gradle**。它會：
    - 在 `gradle.projectsEvaluated` 內設定 `failFast = false`（踩坑 10）、`forkEvery = 1`（踩坑 11）
-   - 依 `RECENT_TESTS_FILE` 只跑近期修改的測試，清單為空就讓建置失敗（踩坑 12）
+   - 依 `RECENT_TESTS_FILE` 只跑近期修改的測試，清單為空就讓建置失敗（踩坑 12）。測試多年沒動的專案，範本改用 `emptyRecentTests: buildOnly`：沒有近期測試時明確切換成只建置、不載入 init script
    - 套用 `EXCLUDED_TESTS` 排除清單，每筆都要寫原因與移除條件（第 5.1 節）
 4. 參數重點：
    - `timeoutInMinutes`：預設 120。ADO 預設 job 逾時 60 分鐘，首次建置（下載依賴＋獨立 JVM 測試）不夠（踩坑 26）。範本都是 `jobs:` 結構，逾時設在 job 上。
@@ -185,6 +203,7 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
    - `dependencyRepos`＋`resources.repositories`：`settings.gradle` 引用同層的其他 repo 時，兩處都要填，並排 checkout，並先確認被引用 repo 的分支含有需要的 commit（踩坑 14）。
 5. **第一次建置前的檢查**：
    - 比對專案 `gradle/wrapper/gradle-wrapper.properties` 的版本與 `servers.yml` 的 `cached_gradle_versions`（`ci-discover.sh` 會自動比對）。不在清單內就**第一次取消 offline 連線跑**，成功後把版本補進清單（踩坑 25）。
+   - **版本在清單內也不保證離線能過**：這個專案自己的依賴可能沒被這台 agent 下載過（踩坑 38）。新專案第一次建置一律連線跑（`ado-run.sh ... -p offline=false`），成功後再用預設的離線模式跑一次確認。
    - pipeline 檔目前只在測試分支時，網頁第一次 Run 要把分支改成含 yaml 的分支，否則會報找不到有效 YAML（踩坑 28）。
 6. 明確傳 `-Dorg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g`，不依賴開發者的個人設定（踩坑 8）。
 7. 測試需要的環境變數放在 pipeline 的 `env`，值用 pipeline 變數或 secret（踩坑 9）。
@@ -202,6 +221,13 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 | 測試統計 | `GET $ADO/<專案>/_apis/test/runs?buildUri=<build 的 uri>`，看 `totalTests`、`passedTests` 等欄位 |
 
 `api-version` 依伺服器版本指定。
+
+觸發與等待結果可以用 `ado-run.sh`（排入建置只需要 Build：讀取與執行）：
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/scripts/ado-run.sh" --config .ci-tools.yml --pipeline "<pipeline 名稱或 id>" --branch main -p offline=false
+# 輪詢到完成；失敗時印出失敗步驟名稱與 log 末段。--no-wait 只觸發不等待
+```
 
 判讀時注意：
 
@@ -299,20 +325,36 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 
 使用者要求設定對外存取時，說明這是另一個議題，先列出上述限制，不要直接動手。
 
+## 9. CD：從 agent 經 SSH 部署到 VM
+
+完整做法見 `references/cd-ssh-vm.md`，範本在 `references/cd-templates/`。**來源專案的整體流程已跑通 dry-run 與正式部署；`deploy-vm.ps1` 等範本是改寫版、未驗證**，套用時照實告知使用者。摘要：
+
+1. **先探測再設計**：用 `cd-templates/probe-agent-ssh.yml` 建臨時 pipeline，確認 agent 能 TCP 連到 VM、完成 SSH 握手，並列出 agent 上的工具。自架 Windows agent 的 MinGit 沒有 bash（踩坑 40），部署邏輯要用 PowerShell 5.1＋Windows 內建 OpenSSH。探測完刪掉臨時 repo 與自動建立的 pipeline（踩坑 36）。
+2. **部署分支只建在 ADO**：Gitea 只能經 VPN、不設 push mirror 時，觸發點只能在 ADO。要部署時把 commit 推到 ADO 的部署分支；`cd-templates/push-deploy-branch.sh` 會檢查本機沒有未推上 Gitea 的 commit，再依序快轉依賴 repo、主 repo，最後移動部署分支。
+3. **金鑰**：CD 專用金鑰（不重用個人金鑰），私鑰上傳為 secure file（權杖要 Secure Files 範圍）並授權 pipeline；VM 主機金鑰以檔案釘選，`StrictHostKeyChecking=yes`。
+4. **pipeline 兩個 stage**：Build 照舊，部署分支才發佈產物（**Build Artifacts**，Server 版不支援 Pipeline Artifacts，踩坑 37）；Deploy stage 只在部署分支執行，提供 dry-run 參數。
+5. **建立／移動部署分支會立刻觸發真部署**（踩坑 39）：先用 `ado-authorize.sh revoke --securefile <名稱> --pipelines <id>` 撤銷授權 → 移動分支 → 取消自動觸發的建置 → 恢復授權 → 手動以 dry-run 執行。
+6. **PowerShell 5.1**：`.ps1` 存 UTF-8 with BOM（踩坑 41）、包裝原生程式時暫改 `ErrorActionPreference`（踩坑 42）；推送前用 PowerShell 7 模擬 5.1 讀檔做解析檢查。
+7. **agent 上的 ssh／scp 不要設 `ConnectTimeout`**（踩坑 44）：Windows 版 OpenSSH 8.1 會每次等滿逾時才連上，分段上傳慢十倍以上而撞到 job 逾時。上傳慢時先用探測 pipeline 量 `ssh true` 的耗時，再對照 .NET 直接建 TCP 連線的時間。
+
 ---
 
 ## 參考檔
 
 | 檔案 | 內容 |
 |------|------|
-| `references/pitfalls.md` | 33 條踩坑：症狀、根因、解法、驗證狀態 |
+| `references/pitfalls.md` | 44 條踩坑：症狀、根因、解法、驗證狀態 |
 | `references/servers.example.yml` | 使用者層設定範例（server、權杖變數名、agent 路徑、已快取 Gradle 版本） |
 | `references/ci-tools.example.yml` | 專案層設定範例（repos 清單、pipeline 參數、基準分支） |
 | `references/ci-init.gradle` | Gradle CI init script |
 | `references/pipeline-templates/` | 五個 pipeline 範本 |
 | `references/e2e-layering.md` | 測試分層與 E2E 執行原則 |
+| `references/cd-ssh-vm.md` | CD：從 Windows agent 經 SSH 部署到 VM 的流程、陷阱與遠端腳本契約 |
+| `references/cd-templates/` | CD 範本：探測 pipeline、agent 端部署腳本、Deploy stage 片段、一鍵觸發腳本 |
 | `${CLAUDE_PLUGIN_ROOT}/scripts/ci-discover.sh` | 第 0 步：唯讀探索既有設定並建議下一步 |
 | `${CLAUDE_PLUGIN_ROOT}/scripts/sync-gitea-to-ado.sh` | Gitea → ADO 單一 repo 單向快轉同步 |
 | `${CLAUDE_PLUGIN_ROOT}/scripts/sync-all-repos.sh` | 依 `.ci-tools.yml` 同步所有 repo（整批把關、依賴先推） |
 | `${CLAUDE_PLUGIN_ROOT}/scripts/ci-triage.sh` | 首次建置失敗分類：抽出失敗類別、產生本機重跑與基準比對指令 |
+| `${CLAUDE_PLUGIN_ROOT}/scripts/ado-run.sh` | 觸發 pipeline（分支、`templateParameters`）、輪詢至完成、印出失敗步驟 log |
+| `${CLAUDE_PLUGIN_ROOT}/scripts/ado-authorize.sh` | 列出／授權／撤銷 pipeline 對佇列、repo、secure file 的使用權限，寫入後讀回比對 |
 | `${CLAUDE_PLUGIN_ROOT}/scripts/lib/ci_config.py` | 兩層設定檔的讀取器（無外部依賴） |

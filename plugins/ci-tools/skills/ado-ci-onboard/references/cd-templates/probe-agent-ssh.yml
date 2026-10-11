@@ -1,0 +1,57 @@
+# 臨時探測 pipeline：自架 Windows agent 能否連到目標 VM 的 SSH、agent 上有哪些工具（cd-ssh-vm.md 第 1 步）
+#
+# 驗證狀態：已在一個實際專案跑過（TCP 22 與 SSH 握手確認可達）；本檔為去識別化版，改寫後未在 ADO 重跑。
+#
+# 用法：
+#   1. 在 ADO 建一個臨時 repo（只在 ADO），用 REST pushes API 推入本檔為 /azure-pipelines.yml
+#   2. 建 pipeline、授權 agent 佇列（pipelinePermissions/queue/<id>）、手動執行
+#   3. 看完輸出後刪除 pipeline 與 repo；推入新 repo 時 ADO 會自動多建一條「<repo> CI」pipeline，也要刪
+# 不需要任何金鑰：不帶金鑰的 ssh 收到主機金鑰／Permission denied，就代表 SSH 服務可達。
+# 步驟顯示失敗不一定是連不上：ssh 把「已加入 known hosts」寫到 stderr，PowerShell 會當成錯誤，請看輸出內容判斷。
+
+trigger: none
+
+pool:
+  name: Default        # 依 servers.yml 的 agent pool 調整
+
+variables:
+  VM_HOST: '<VM 位址>'
+  VM_PORT: '22'
+
+jobs:
+  - job: probe
+    timeoutInMinutes: 10
+    steps:
+      - checkout: none
+      - powershell: |
+          Write-Host "== agent：$env:COMPUTERNAME／$env:AGENT_NAME／執行帳號 $(whoami)"
+          Write-Host "== TCP 連線測試"
+          Test-NetConnection '$(VM_HOST)' -Port $(VM_PORT) -WarningAction SilentlyContinue |
+            Format-List ComputerName,RemoteAddress,InterfaceAlias,SourceAddress,TcpTestSucceeded
+          $git = Join-Path '$(Agent.HomeDirectory)' 'externals\git'
+          Write-Host "== agent 內附 Git：$git"
+          foreach ($t in 'bin\bash.exe','usr\bin\ssh.exe','usr\bin\scp.exe','usr\bin\sha256sum.exe','usr\bin\unzip.exe','usr\bin\stat.exe','usr\bin\awk.exe','usr\bin\sed.exe') {
+            $p = Join-Path $git $t
+            Write-Host ("  {0,-22} {1}" -f $t, $(if (Test-Path $p) { '有' } else { '無' }))
+          }
+          Write-Host "== 系統 PATH 上的工具"
+          foreach ($c in 'ssh','scp','bash','unzip') {
+            $x = Get-Command $c -ErrorAction SilentlyContinue
+            Write-Host ("  {0,-6} {1}" -f $c, $(if ($x) { $x.Source } else { '無' }))
+          }
+          Write-Host "== SSH 握手測試（不帶金鑰）"
+          $ssh = Join-Path $env:WINDIR 'System32\OpenSSH\ssh.exe'
+          if (-not (Test-Path $ssh)) { $ssh = Join-Path $git 'usr\bin\ssh.exe' }
+          if (Test-Path $ssh) {
+            $ErrorActionPreference = 'Continue'
+            # 不加 ConnectTimeout：Windows 版 OpenSSH 8.1 會等滿這個秒數才回報連線成功（踩坑 44）。
+            # 這裡用 StrictHostKeyChecking=no 只因為是「不帶金鑰、只看握手」的探測，不會登入也不會傳任何資料；
+            # 正式部署必須以檔案釘選主機金鑰並用 StrictHostKeyChecking=yes（見 cd-ssh-vm.md）
+            $out = & $ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL `
+                     -o PubkeyAuthentication=no -o PasswordAuthentication=no -p $(VM_PORT) probe-nobody@$(VM_HOST) exit 2>&1
+            Write-Host "  ssh=$ssh"
+            $out | ForEach-Object { Write-Host "  $_" }
+            Write-Host '  （看到主機金鑰被加入或 Permission denied＝SSH 服務可達）'
+          } else { Write-Host '  找不到 ssh' }
+          exit 0
+        displayName: '探測連線與工具'
