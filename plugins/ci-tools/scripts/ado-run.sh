@@ -166,16 +166,24 @@ esac
 echo "結果：${result}（run ${RUN_ID}）"
 code="$(req GET "$BASE/build/builds/$RUN_ID/timeline?api-version=$api")"
 [ "$code" = 200 ] || http_fail "$code" "取得 timeline"
+# stage／job 層級的錯誤訊息（例：job 逾時「執行超過 60 分鐘」只記在 job 的 issues，步驟會是 canceled 而非 failed）
 json "
 for r in d.get('records',[]):
-    if r.get('type')=='Task' and r.get('result')=='failed':
-        print(r.get('name',''), (r.get('log') or {}).get('id',''), sep='\t')
+    if r.get('type') in ('Stage','Phase','Job') and r.get('result') in ('failed','canceled'):
+        for i in (r.get('issues') or []):
+            if i.get('type')=='error':
+                print('  [' + r.get('type','') + ' ' + r.get('result','') + '] ' + r.get('name','') + '：' + (i.get('message') or ''))
+"
+json "
+for r in d.get('records',[]):
+    if r.get('type')=='Task' and r.get('result') in ('failed','canceled'):
+        print(r.get('name',''), (r.get('log') or {}).get('id',''), r.get('result',''), sep='\t')
 " >| "$WORK/failed.tsv"
 if [ ! -s "$WORK/failed.tsv" ]; then
-  echo "timeline 沒有標記失敗的步驟（可能失敗在 stage／job 層級，例如權限或資源未授權）"
+  echo "timeline 沒有失敗或被取消的步驟（可能失敗在 stage／job 層級，例如權限或資源未授權，見上方訊息）"
 fi
-while IFS=$'\t' read -r name logid; do
-  echo "---- 失敗步驟：${name}（log ${logid}）最後 40 行 ----"
+while IFS=$'\t' read -r name logid tres; do
+  echo "---- ${tres} 的步驟：${name}（log ${logid}）最後 40 行 ----"
   if [ -n "$logid" ]; then
     code="$(req GET "$BASE/build/builds/$RUN_ID/logs/$logid?api-version=$api")"
     if [ "$code" = 200 ]; then tail -40 "$RESP"; else echo "（取得 log 失敗：HTTP ${code}）"; fi

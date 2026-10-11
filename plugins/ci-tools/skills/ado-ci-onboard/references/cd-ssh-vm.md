@@ -92,6 +92,7 @@ agent 的 PowerShell task 預設用 Windows PowerShell 5.1：
 | 管線傳字串給原生程式 | 依 `$OutputEncoding` 轉成 ASCII，中文變 `?` | 不用管線；先把腳本寫成檔案 scp 上去，再 ssh 執行 | 未驗證（依 PowerShell 5.1 的 `$OutputEncoding` 行為預防） |
 | CRLF | checkout 可能是 CRLF，bash 遇 `\r` 出錯 | 送到 VM 前轉 LF、UTF-8 無 BOM 寫出 | 未驗證（預防） |
 | 私鑰權限 | Windows OpenSSH 拒絕其他帳號可讀的私鑰 | 複製一份後 `icacls <key> /inheritance:r /grant:r "<whoami>:R"` | 未驗證（預防） |
+| `ConnectTimeout` | Windows 版 OpenSSH 8.1 設了它，每次連線都等滿這個秒數才成功，分段上傳慢十倍以上 | ssh／scp 不設 `ConnectTimeout`，逾時改在外層處理 | 已驗證（踩坑 44） |
 | scp 逾時 | scp 會再開 ssh 子程序，只 kill scp 會留下子程序 | `taskkill /T /F /PID <pid>` 結束整棵程序樹 | 未驗證（預防） |
 
 **推送前的本機檢查**（省一輪建置）：下載官方 PowerShell 7 tarball（免安裝），以「有 BOM 讀 UTF-8、否則以 Big5 讀」模擬 PS 5.1 讀檔，再用

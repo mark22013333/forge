@@ -70,6 +70,13 @@ cat >| "$T/r/timeline.json" <<'EOF'
  {"type":"Task","name":"Gradle 建置","result":"failed","log":{"id":5}}]}
 EOF
 printf 'line1\nline2\nERROR-LINE-XYZ: compile failed\n' >| "$T/r/log5.txt"
+# job 逾時：job 為 canceled 並帶 error issue，步驟為 canceled（不是 failed）
+cat >| "$T/r/timeline-timeout.json" <<'EOF'
+{"records":[{"type":"Stage","name":"Deploy","result":"failed"},
+ {"type":"Job","name":"deploy","result":"canceled","issues":[{"type":"error","message":"JOB-TIMEOUT-MSG ran longer than 60 minutes"}]},
+ {"type":"Task","name":"upload","result":"canceled","log":{"id":9}}]}
+EOF
+printf 'uploaded 140/210\nUPLOAD-TAIL-LINE\n' >| "$T/r/log9.txt"
 echo '{"message":"unauthorized"}' >| "$T/r/err.json"
 
 # 設定檔（example 值）
@@ -123,9 +130,17 @@ echo "$OUT" | sed 's/^/    | /'
 check "exit 2" '[ $RC -eq 2 ]'
 check "數字 id 不查 pipeline 清單" '! grep -q "/_apis/pipelines?" "$FAKE_LOG"'
 check "沒給分支就不帶 resources" '! grep "^POST" "$FAKE_LOG" | cut -f3 | grep -q resources'
-check "印出失敗步驟名稱" 'echo "$OUT" | grep -q "失敗步驟：Gradle 建置（log 5）"'
+check "印出失敗步驟名稱" 'echo "$OUT" | grep -q "failed 的步驟：Gradle 建置（log 5）"'
 check "印出 log 內容" 'echo "$OUT" | grep -q "ERROR-LINE-XYZ"'
 check "成功的步驟不抓 log" '! grep -q "/logs/2" "$FAKE_LOG"'
+
+scenario "情境 2b：job 逾時 → 印出 job 的錯誤訊息與被取消步驟的 log" "$R_RUN" $'GET\t/build/builds/101?\t200\tb-fail.json' $'GET\t/builds/101/timeline\t200\ttimeline-timeout.json' $'GET\t/builds/101/logs/9\t200\tlog9.txt'
+OUT="$(bash "$RUN" "${args[@]}" --pipeline 7 2>&1)"; RC=$?
+echo "$OUT" | sed 's/^/    | /'
+check "exit 2" '[ $RC -eq 2 ]'
+check "印出 job 層級的逾時訊息" 'echo "$OUT" | grep -q "\[Job canceled\] deploy：JOB-TIMEOUT-MSG"'
+check "被取消的步驟也抓 log" 'echo "$OUT" | grep -q "canceled 的步驟：upload（log 9）" && echo "$OUT" | grep -q "UPLOAD-TAIL-LINE"'
+check "不再誤報「沒有失敗或被取消的步驟」" '! echo "$OUT" | grep -q "沒有失敗或被取消的步驟"'
 
 scenario "情境 3：觸發回 401 → 說明權杖範圍" $'POST\t/_apis/pipelines/7/runs\t401\terr.json'
 OUT="$(bash "$RUN" "${args[@]}" --pipeline 7 2>&1)"; RC=$?

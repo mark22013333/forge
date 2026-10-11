@@ -52,9 +52,11 @@ Copy-Item $KeyFile $Key
 # Windows OpenSSH 拒絕其他帳號可讀的私鑰：移除繼承、只留目前帳號
 & icacls $Key /inheritance:r /grant:r "$(whoami):R" | Out-Null
 if ($LASTEXITCODE -ne 0) { Die '無法設定私鑰檔權限' }
+# 不設 ConnectTimeout：Windows 版 OpenSSH 8.1 設了它之後，每次連線都會等滿這個秒數才回報成功（踩坑 44）；
+# 分段上傳另有 ChunkTimeoutSec 的逾時保護
 $SshOpts = @('-i', $Key, '-P', "$VmPort", '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
              '-o', "UserKnownHostsFile=$KnownHostsFile", '-o', 'StrictHostKeyChecking=yes',
-             '-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=3', '-o', 'LogLevel=ERROR')
+             '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=3', '-o', 'LogLevel=ERROR')
 $SshOnlyOpts = $SshOpts | ForEach-Object { if ($_ -eq '-P') { '-p' } else { $_ } }   # ssh 用 -p、scp 用 -P
 $Target = "$VmUser@$VmHost"
 

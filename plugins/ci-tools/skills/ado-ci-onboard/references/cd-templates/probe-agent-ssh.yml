@@ -44,9 +44,10 @@ jobs:
           if (-not (Test-Path $ssh)) { $ssh = Join-Path $git 'usr\bin\ssh.exe' }
           if (Test-Path $ssh) {
             $ErrorActionPreference = 'Continue'
+            # 不加 ConnectTimeout：Windows 版 OpenSSH 8.1 會等滿這個秒數才回報連線成功（踩坑 44）。
             # 這裡用 StrictHostKeyChecking=no 只因為是「不帶金鑰、只看握手」的探測，不會登入也不會傳任何資料；
             # 正式部署必須以檔案釘選主機金鑰並用 StrictHostKeyChecking=yes（見 cd-ssh-vm.md）
-            $out = & $ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL `
+            $out = & $ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL `
                      -o PubkeyAuthentication=no -o PasswordAuthentication=no -p $(VM_PORT) probe-nobody@$(VM_HOST) exit 2>&1
             Write-Host "  ssh=$ssh"
             $out | ForEach-Object { Write-Host "  $_" }

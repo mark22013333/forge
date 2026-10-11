@@ -335,6 +335,7 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 4. **pipeline 兩個 stage**：Build 照舊，部署分支才發佈產物（**Build Artifacts**，Server 版不支援 Pipeline Artifacts，踩坑 37）；Deploy stage 只在部署分支執行，提供 dry-run 參數。
 5. **建立／移動部署分支會立刻觸發真部署**（踩坑 39）：先用 `ado-authorize.sh revoke --securefile <名稱> --pipelines <id>` 撤銷授權 → 移動分支 → 取消自動觸發的建置 → 恢復授權 → 手動以 dry-run 執行。
 6. **PowerShell 5.1**：`.ps1` 存 UTF-8 with BOM（踩坑 41）、包裝原生程式時暫改 `ErrorActionPreference`（踩坑 42）；推送前用 PowerShell 7 模擬 5.1 讀檔做解析檢查。
+7. **agent 上的 ssh／scp 不要設 `ConnectTimeout`**（踩坑 44）：Windows 版 OpenSSH 8.1 會每次等滿逾時才連上，分段上傳慢十倍以上而撞到 job 逾時。上傳慢時先用探測 pipeline 量 `ssh true` 的耗時，再對照 .NET 直接建 TCP 連線的時間。
 
 ---
 
@@ -342,7 +343,7 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 
 | 檔案 | 內容 |
 |------|------|
-| `references/pitfalls.md` | 43 條踩坑：症狀、根因、解法、驗證狀態 |
+| `references/pitfalls.md` | 44 條踩坑：症狀、根因、解法、驗證狀態 |
 | `references/servers.example.yml` | 使用者層設定範例（server、權杖變數名、agent 路徑、已快取 Gradle 版本） |
 | `references/ci-tools.example.yml` | 專案層設定範例（repos 清單、pipeline 參數、基準分支） |
 | `references/ci-init.gradle` | Gradle CI init script |

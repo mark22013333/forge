@@ -1,8 +1,8 @@
 # 踩坑表：自架 Azure DevOps Server 導入 CI
 
-這 43 條都是實際導入時遇到的問題，不是從文件整理來的。每條都列症狀、根因、解法、驗證狀態。
+這 44 條都是實際導入時遇到的問題，不是從文件整理來的。每條都列症狀、根因、解法、驗證狀態。
 
-第 1～24 條來自第一個導入的專案；第 25～33 條來自第二個專案（Gradle 8.14.3、主 repo＋依賴 repo，接在已經裝好的同一台 server 上）；第 34～43 條來自第三個專案（Gradle 7.5.1、主 repo＋依賴 repo，另有一個獨立 repo，接在同一台 server 上，並做了從 Windows agent 經 SSH 部署到 Linux VM 的 CD）。
+第 1～24 條來自第一個導入的專案；第 25～33 條來自第二個專案（Gradle 8.14.3、主 repo＋依賴 repo，接在已經裝好的同一台 server 上）；第 34～44 條來自第三個專案（Gradle 7.5.1、主 repo＋依賴 repo，另有一個獨立 repo，接在同一台 server 上，並做了從 Windows agent 經 SSH 部署到 Linux VM 的 CD）。
 
 ## 驗證狀態的意思
 
@@ -153,6 +153,13 @@
 - **根因**：Windows PowerShell 5.1 在 `2>&1` 重導或 `$ErrorActionPreference = 'Stop'` 時，把原生程式的 stderr 輸出當成錯誤紀錄處理（依 PowerShell 的已知行為判斷，未另做對照實驗）。
 - **解法**：在包裝原生程式的函式內暫時設 `$ErrorActionPreference = 'Continue'`，成敗改看 `$LASTEXITCODE`；ssh 另加 `-o LogLevel=ERROR` 減少雜訊。
 - **驗證狀態**：已遇到（探測 pipeline 的連線本身成功，步驟卻因這行警告失敗）
+
+### 44. Windows 版 OpenSSH 8.1 設了 ConnectTimeout，每次連線都等滿逾時
+
+- **症狀**：agent 上每一次 `ssh`／`scp` 都固定多花好幾秒，而且秒數非常一致；分段上傳時每段固定多出約 2×ConnectTimeout，整體上傳慢十倍以上，最後撞到 job 逾時被取消。
+- **根因**：Windows 內建的 `OpenSSH_for_Windows_8.1p1` 在設了 `ConnectTimeout` 時，連線會等滿這個秒數才回報成功（`ssh -v` 可看到 `Connecting to ...` 與 `Connection established` 之間剛好隔 ConnectTimeout 秒）。網路本身沒問題：同一台 agent 用 .NET 直接建 TCP 連線只要 0.05 秒。
+- **解法**：agent 端的 ssh／scp **不要設 `ConnectTimeout`**；需要逾時保護時在外層做（例如分段上傳每段以 `Start-Process` 啟動、逾時就 `taskkill /T`）。排查時先用探測 pipeline 量「ssh true」的耗時，與 .NET TcpClient 的連線時間對照。
+- **驗證狀態**：已驗證（同一台 agent 上 `ssh true`：ConnectTimeout=5／30／不設 → 5.6／30.6／0.7 秒，各兩次一致；不設時 scp 3MB 約 1.5 秒）
 
 ## 測試執行
 
