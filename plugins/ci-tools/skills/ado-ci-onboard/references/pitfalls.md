@@ -1,8 +1,8 @@
 # 踩坑表：自架 Azure DevOps Server 導入 CI
 
-這 44 條都是實際導入時遇到的問題，不是從文件整理來的。每條都列症狀、根因、解法、驗證狀態。
+這 51 條都是實際導入時遇到的問題，不是從文件整理來的。每條都列症狀、根因、解法、驗證狀態。
 
-第 1～24 條來自第一個導入的專案；第 25～33 條來自第二個專案（Gradle 8.14.3、主 repo＋依賴 repo，接在已經裝好的同一台 server 上）；第 34～44 條來自第三個專案（Gradle 7.5.1、主 repo＋依賴 repo，另有一個獨立 repo，接在同一台 server 上，並做了從 Windows agent 經 SSH 部署到 Linux VM 的 CD）。
+第 1～24 條來自第一個導入的專案；第 25～33 條來自第二個專案（Gradle 8.14.3、主 repo＋依賴 repo，接在已經裝好的同一台 server 上）；第 34～44 條來自第三個專案（Gradle 7.5.1、主 repo＋依賴 repo，另有一個獨立 repo，接在同一台 server 上，並做了從 Windows agent 經 SSH 部署到 Linux VM 的 CD）；第 45～51 條來自第四次導入（在一台全新的 Windows Server 2022 上安裝 SQL Server 2025 Express 具名執行個體與 Azure DevOps Server 25H2，再把一個既有專案的 CI／CD 從舊 server 搬過去）。
 
 ## 驗證狀態的意思
 
@@ -15,7 +15,7 @@
 
 引用這份表時，請保留狀態標註，不要把「估計」或「未釐清」寫成肯定句。
 
-實測環境：ADO Server Express＋SQL Server 2025 Express（具名執行個體），裝在 Windows 11 專業版工作站。這個 OS 組合不在官方支援清單內（見第 21 條）。
+實測環境：ADO Server Express＋SQL Server 2025 Express（具名執行個體），裝在 Windows 11 專業版工作站。這個 OS 組合不在官方支援清單內（見第 21 條）。第四次導入的環境是 Windows Server 2022（工作群組、未加入網域，雲端 VM）＋SQL Server 2025 Express（具名執行個體）＋Azure DevOps Server 25H2。
 
 依主題分類，所以編號不連續。
 
@@ -56,6 +56,27 @@
 - **症狀**：Agent pools 頁面的「新增代理程式」對話框沒有內容，套件清單是空的（前端 JS 錯誤）。
 - **根因**：網頁對話框的前端問題。
 - **解法**：直接呼叫 REST API `_apis/distributedtask/packages/agent?platform=win-x64`，取得伺服器指定的 agent 版本與下載網址。
+- **驗證狀態**：已遇到
+
+### 47. 安裝精靈選錯部署類型，要你從空的清單選既有資料庫
+
+- **症狀**：全新安裝、要用已裝好的 SQL 具名執行個體，精靈卻要求從資料庫清單選一個既有的 ADO 資料庫，而清單是空的。另外，SQL 執行個體欄位只寫執行個體名稱時，被當成電腦名稱去找。
+- **根因**：選到「現有的部署」——那是給「資料庫已存在（升級或搬移）」用的。另外，SQL 執行個體欄位只寫 `<執行個體>` 時，會被當成電腦名稱解析。
+- **解法**：全新安裝並指定既有 SQL 具名執行個體時，選「**新的部署 - 進階**」。執行個體欄位寫 `.\<執行個體>` 或 `localhost\<執行個體>`。
+- **驗證狀態**：已遇到
+
+### 49. 公用 URL 預設是主機的電腦名稱，用戶端連不到
+
+- **症狀**：網頁、git clone 網址、通知信裡的連結都是 `http://<電腦名稱>:<port>`，用戶端開不起來，但改用 IP 直接連就正常。
+- **根因**：公用 URL 預設取主機的電腦名稱。主機在雲端或工作群組（沒有網域 DNS）時，用戶端常解析不到這個名稱。
+- **解法**：安裝時，或之後在管理主控台的「變更公用 URL」，改成用戶端連得到的位址（IP 或 FQDN，例：`http://192.0.2.10:8080`）。servers.yml 的 `url` 也用同一個位址。
+- **驗證狀態**：已遇到
+
+### 50. 套用 Patch：管理主控台開著就停止；修補後 Git SSH 服務可能沒有自動啟動
+
+- **症狀**：執行 Patch 安裝程式時直接停止，提示要先關閉管理主控台。修補完成、重開機後，Git over SSH 連不上，HTTP 仍正常。
+- **根因**：修補工具要求管理主控台（`TfsMgmt.exe`）不在執行中。Git SSH 服務 `TeamFoundationSshService` 的啟動類型可能是「手動」，修補工具不會啟動它，所以重開機後 SSH 就斷了。
+- **解法**：套用 Patch 前先關閉管理主控台。修補後檢查 SSH 服務的啟動類型，改成自動：`Set-Service TeamFoundationSshService -StartupType Automatic`，再 `Start-Service TeamFoundationSshService`。修補後的版本可在登錄 `HKLM\SOFTWARE\Microsoft\TeamFoundationServer\<版本>` 的 `PatchVersion` 確認。
 - **驗證狀態**：已遇到
 
 ## 驗證與權限
@@ -102,6 +123,13 @@
 - **根因**：新專案的 pipeline 還沒被授權使用資源：agent 佇列（`queue`）、yaml 裡 `resources.repositories` 引用的其他 repo（`repository`，id 為 `<專案 id>.<repo id>`）、`DownloadSecureFile` 用到的 secure file（`securefile`）。網頁上會出現「需要權限」的 Permit 按鈕，REST 觸發時看不到。
 - **解法**：`GET _apis/pipelines/pipelinePermissions/<type>/<id>?api-version=6.1-preview.1` 看授權清單（空的就是原因），`PATCH` 同一路徑、body `{"pipelines":[{"id":<pipeline id>,"authorized":true}]}`，再讀回確認。可用 `scripts/ado-authorize.sh`。
 - **驗證狀態**：已驗證（授權清單為空 → PATCH 後同一次建置隨即開始執行）
+
+### 48. 工作群組主機：ADO 使用者就是主機上的本機 Windows 帳號
+
+- **症狀**：主機沒有加入網域，不知道怎麼新增 ADO 使用者；人員選取器搜尋帳號名稱找不到人；照文件找英文群組名稱（例：Project Collection Administrators）找不到。
+- **根因**：工作群組主機上，ADO 的使用者就是這台主機的本機 Windows 帳號。介面選了非英文語言時，內建群組名稱也會被翻譯（例：繁中介面的「專案集合系統管理員」）。
+- **解法**：新增使用者要先在主機上建立本機 Windows 帳號，再到 ADO 把它加進群組。登入時帳號寫 `<主機名>\<帳號>`；人員選取器搜尋不到時，輸入完整的 `<主機名>\<帳號>`。依文件找群組時，用介面語言的翻譯名稱找。
+- **驗證狀態**：已遇到
 
 ## Agent 與建置環境
 
@@ -161,6 +189,13 @@
 - **解法**：agent 端的 ssh／scp **不要設 `ConnectTimeout`**；需要逾時保護時在外層做（例如分段上傳每段以 `Start-Process` 啟動、逾時就 `taskkill /T`）。排查時先用探測 pipeline 量「ssh true」的耗時，與 .NET TcpClient 的連線時間對照。
 - **驗證狀態**：已驗證（同一台 agent 上 `ssh true`：ConnectTimeout=5／30／不設 → 5.6／30.6／0.7 秒，各兩次一致；不設時 scp 3MB 約 1.5 秒）
 
+### 51. agent 與 ADO 同一台：驗證不用 PAT、JDK 能力自動偵測、共用快取的權限
+
+- **症狀**：照一般做法要先產生 PAT 才能設定 agent；agent 上線後能力清單已經有 `jdk_17_x64` 等項目，即使系統 `JAVA_HOME` 指向別的版本。
+- **根因**：agent 與 ADO 裝在同一台時，`config.cmd` 的驗證類型預設是 Integrated（以目前登入的 Windows 帳號驗證），不需要 PAT；agent 裝在別台才需要 PAT。agent 會自行偵測已安裝的 JDK 並登記成能力，不看 `JAVA_HOME`。
+- **解法**：同機安裝時直接用預設的 Integrated。pipeline 的 `demands` 可直接用自動登記的 `jdk_17_x64` 這類能力。agent 以 NETWORK SERVICE 執行時，共用快取目錄（Gradle、npm）要給它修改權限：`icacls <目錄> /grant "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M"`，否則別的帳號放進去的檔案它改不動（同類問題見第 7 條）。
+- **驗證狀態**：Integrated 驗證與 JDK 能力自動偵測為已遇到；快取目錄權限為**未驗證（預防）**，沒有實際發生過寫入失敗
+
 ## 測試執行
 
 ### 9. 測試需要環境變數與設定檔
@@ -209,6 +244,20 @@
 - **驗證狀態**：**未釐清**（數字差異的原因）
 
 ## 原始碼與建置
+
+### 45. secure file 不存在或未授權，整條 pipeline 在驗證階段就失敗
+
+- **症狀**：建置幾秒內就 completed/failed；timeline API 回 **HTTP 204**（沒有任何 record），網頁上也看不到任何步驟；即使這次的 condition 根本不會執行用到 secure file 的那個 stage，也一樣失敗。
+- **根因**：YAML 引用的 secure file 在 pipeline 派工前的驗證階段就會檢查。找不到或未授權時整條 pipeline 無效，錯誤只記在 `GET _apis/build/builds/<id>` 回應的 `validationResults` 裡，訊息類似「管線無效。作業 deploy: 找不到步驟 X 輸入 secureFile 參考的安全檔案 deploy-key」。
+- **解法**：建置秒失敗且 timeline 為空時，先看 build 的 `validationResults`（`scripts/ado-run.sh` 會自動印出）。搬到新 server 時，secure file 要在第一次建置前上傳並授權 pipeline（授權見第 35 條、`scripts/ado-authorize.sh`）。
+- **驗證狀態**：已驗證
+
+### 46. 「匯入存放庫」的入口不同，結果不同：會另外新建 repo
+
+- **症狀**：先建好同名的空 repo，再從 Repos 頁面上方的 repo 下拉選單選「匯入存放庫」，結果多出一個名稱帶 `.git` 的新 repo（例：`product-core.git`），原本的空 repo 還是空的。
+- **根因**：下拉選單的「匯入存放庫」一律**新建** repo，名稱預設取來源網址最後一段（含 `.git`），即使同名空 repo 已存在。要匯入既有的空 repo，得在該空 repo 的頁面上用「匯入」。
+- **解法**：要匯入既有空 repo 時，先切到那個 repo 再按它頁面上的「匯入」。匯入會帶入來源的所有分支，預設分支沿用來源，匯入後要改成正式分支（PATCH 要用 repo id，見第 18、27 條）。優點：由 ADO server 直接從 Git 平台拉，不經過開發者電腦或 VPN，適合大型 repo（實例約 940MB）。
+- **驗證狀態**：已遇到
 
 ### 14. 多 repo 並排 checkout
 
