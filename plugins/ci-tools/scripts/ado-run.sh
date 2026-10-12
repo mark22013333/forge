@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ado-run.sh — 以 REST API 觸發 ADO pipeline（可帶 templateParameters），輪詢到完成，失敗時印出失敗步驟的 log
+# ado-run.sh — 以 REST API 觸發 ADO pipeline（可帶 templateParameters），輪詢到完成，失敗時印出驗證訊息與失敗步驟的 log
 #
 # 會對 ADO 送出一個寫入動作：排入一次執行（POST pipelines/<id>/runs）。其餘只發 GET。
 # 權杖只從環境變數讀（servers.yml 的 pat_env），以 curl 設定檔從 stdin 傳入，不出現在指令列，也不會印出。
@@ -159,12 +159,36 @@ done
 result="${state#completed/}"
 
 # ---------------------------------------------------------------- 4. 結果
+# 驗證階段的錯誤（例：YAML 引用的 secure file 不存在或未授權，踩坑 45）只記在 build 回應的 validationResults，
+# 此時建置沒有派工、timeline 是空的。${RESP} 此刻仍是最後一次 GET build 的回應。
+VALIDATION_ERRORS=0
+if [ "$result" != succeeded ]; then
+  json "
+for v in (d.get('validationResults') or []):
+    if v.get('result')=='error':
+        print('  [驗證錯誤] ' + (v.get('message') or ''))
+" >| "$WORK/validation.txt"
+  if [ -s "$WORK/validation.txt" ]; then
+    VALIDATION_ERRORS=1
+    echo "建置的驗證訊息（validationResults）："
+    cat "$WORK/validation.txt"
+  fi
+fi
 case "$result" in
   succeeded) echo "結果：成功（run ${RUN_ID}）"; exit 0 ;;
   canceled)  echo "結果：已取消（run ${RUN_ID}）"; exit 3 ;;
 esac
 echo "結果：${result}（run ${RUN_ID}）"
 code="$(req GET "$BASE/build/builds/$RUN_ID/timeline?api-version=$api")"
+if [ "$code" = 204 ]; then
+  # 204 不是連線錯誤：建置在派工前就失敗，沒有任何 timeline record（踩坑 45）
+  if [ "$VALIDATION_ERRORS" -eq 1 ]; then
+    echo "timeline 為空：建置在派工前就失敗，見上方驗證訊息"
+  else
+    echo "timeline 為空：建置在派工前就失敗，但 build 回應沒有 error 等級的驗證訊息；請到網頁查看這次執行（run ${RUN_ID}）"
+  fi
+  exit 2
+fi
 [ "$code" = 200 ] || http_fail "$code" "取得 timeline"
 # stage／job 層級的錯誤訊息（例：job 逾時「執行超過 60 分鐘」只記在 job 的 issues，步驟會是 canceled 而非 failed）
 json "
