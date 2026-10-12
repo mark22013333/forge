@@ -8,6 +8,9 @@
 
 server: home-ado                  # 對應 servers.yml 的 servers.<名稱>；省略時用 default_server
 ado_project: project-a            # ADO 上的專案名稱
+# 以下兩個欄位只有 ado-bootstrap-project.sh 用到，都可省略：
+# ado_process: Basic              # 建立專案時的流程範本名稱；省略時用 server 上標為預設的範本
+# agent_queue: Default            # 授權 pipeline 使用的 agent 佇列；省略時為 Default
 
 # 一個專案可能有多個 repo（例：主 repo 的 settings.gradle 以 ../product-core 引用同層的核心 repo）。
 # 同步腳本依 role 排順序：dependency 先推、main 最後推，避免 CI 先被觸發卻拿到舊的依賴（踩坑 14）。
@@ -16,7 +19,9 @@ repos:
     role: main
     gitea_url: ssh://git@gitea.example.com/team/project-a.git
     ado_repo: project-a           # 省略時等於 name
-    branches: [main, uat]         # 要同步的分支；省略表示兩邊全部
+    branches: [main, uat]         # 要同步的分支；省略表示兩邊全部。第一個也是 bootstrap 設定的預設分支
+    # import_url: https://gitea.example.com/team/project-a.git   # ado-bootstrap-project.sh --import 的來源；
+    #                             # 省略時用 gitea_url，但 server 端匯入要 http(s) 網址（--import 未驗證）
   - name: product-core
     role: dependency
     gitea_url: ssh://git@gitea.example.com/team/product-core.git

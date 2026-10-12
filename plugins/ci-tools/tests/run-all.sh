@@ -5,7 +5,7 @@ set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 FAILED=""
-for t in sync-gitea-to-ado ci-config sync-all-repos ci-triage ci-discover ado-run ado-authorize; do
+for t in sync-gitea-to-ado ci-config sync-all-repos ci-triage ci-discover ado-run ado-authorize ado-bootstrap-project; do
   echo "########## ${t}.test.sh"
   if ! bash "$HERE/${t}.test.sh"; then FAILED="$FAILED $t"; fi
   echo

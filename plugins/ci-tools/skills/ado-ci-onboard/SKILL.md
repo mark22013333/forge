@@ -61,6 +61,8 @@ server 層的資訊（主機、collection、SSH 金鑰、權杖變數名、agent
 | 建 pipeline 定義、排入建置 | Build：讀取與執行 |
 | 上傳 secure file（CD 的部署金鑰） | Secure Files：讀取、建立及管理（已遇到：只有讀取時清單查得到、上傳回 401） |
 | 授權 pipeline 使用資源（`pipelinePermissions`，踩坑 35） | **未驗證**是哪個範圍（實測時權杖已含 Build 讀取與執行等多個範圍） |
+| `ado-bootstrap-project.sh --apply`（建專案、建／改名 repo、改預設分支、建 pipeline、授權） | 上面幾列的合計：Project and Team 讀取、寫入與管理；Code 讀取與寫入；Build 讀取與執行；授權那一步的範圍同上一列**未驗證**。整支腳本沒有在真實 server 上以最小範圍權杖跑過，**哪些範圍足夠未驗證** |
+| `ado-bootstrap-project.sh --import`（建立與刪除暫時的 service endpoint、匯入要求） | 另加 Service Connections：讀取、查詢與管理；Code 需含管理（官方文件標的是 `vso.code_manage`）。**未驗證** |
 | 讀寫 Wiki 頁面 | **未驗證**是哪個範圍（依官方名稱應為 Wiki 讀取與寫入）；改既有頁面要帶 `If-Match`（踩坑 43） |
 
 **401 的判讀**（踩坑 32、5、34）：
@@ -149,7 +151,7 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 
 ### 3.1 建立 ADO 專案與 repo
 
-需要 Project and Team（讀取、寫入與管理）與 Code（讀取與寫入）範圍的權杖；範圍不足時改走網頁（見「權杖（PAT）與權限範圍」）。以下流程在第二個專案實際做過（已遇到）；`api-version` 依伺服器版本指定，範例用 servers.yml 的 `api_version`。
+需要 Project and Team（讀取、寫入與管理）與 Code（讀取與寫入）範圍的權杖；範圍不足時改走網頁（見「權杖（PAT）與權限範圍」）。本節到 3.3 的 REST 步驟可以用 `ado-bootstrap-project.sh` 照順序一次做完（第 6A 章，**未在真實 server 驗證**）；以下是手動做法，也是腳本每一步在做的事。以下流程在第二個專案實際做過（已遇到）；`api-version` 依伺服器版本指定，範例用 servers.yml 的 `api_version`。
 
 1. **取得流程範本 id**：用同一台 server 上既有專案的設定，不要自己猜。
 
@@ -310,6 +312,38 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 - `ADO 領先` 表示有人直接推到了 ADO，違反單向原則。回報給使用者，不要自動處理。
 - 工作 clone 預設放在 `${XDG_DATA_HOME:-$HOME/.local/share}/ci-tools/mirrors/`，不放 `/tmp`（踩坑 16）。
 
+## 6A. 接上新 server／換 server
+
+專案已經在某台 ADO 上跑 CI，要接到另一台（或新專案第一次接上已裝好的 server）時，第 3 章的建專案、建 repo、改預設分支、建 pipeline、授權，可以用 `ado-bootstrap-project.sh` 照順序一次做完。手動做時最容易錯的幾步它都照踩坑處理：預設 repo 改名與改預設分支都用 repo id（踩坑 27）、建 pipeline 回 401 先重新列出（踩坑 34）、已有指向同一個 yaml 的 pipeline 就沿用（踩坑 36）、建完列出名稱以 `.git` 結尾或重複的 repo（踩坑 46）。
+
+**驗證狀態**：腳本只有離線測試（假 curl）；**整支腳本尚未在真實 server 上跑過**，`--import` 那條路徑更是連手動都沒用 REST 做過。第一次使用時先預覽，`--apply` 後到網頁確認結果，並照實告訴使用者這是第一次實跑。
+
+### 步驟
+
+1. **servers.yml 加 server**：照 `references/servers.example.yml` 新增一段（`url`、`collection`、`ssh_url`、`ssh_key`、`pat_env`、`agents`）；整批搬家時可改 `default_server`。
+2. **`.ci-tools.yml` 寫 `server: <名稱>`**，必要時加可選欄位 `ado_process`（流程範本名稱，省略時用 server 的預設範本）、`agent_queue`（省略時 `Default`）。
+3. **預覽**（只發 GET，逐步印出「現況 → 將要做什麼」）：
+
+   ```bash
+   "${CLAUDE_PLUGIN_ROOT}/scripts/ado-bootstrap-project.sh" --config .ci-tools.yml
+   ```
+
+4. **套用**：同一行加 `--apply`。每個寫入都會讀回比對，不一致就以結束碼 2 停下；任一步失敗即停。repo 還沒有內容時，預設分支與 pipeline 兩步會跳過，推送程式碼後**再跑一次**同一行就會補上（已存在的東西一律沿用，可以重複執行）。
+5. **推送程式碼**：預設不動程式碼，用 `sync-all-repos.sh --config .ci-tools.yml --apply`（第 6 章）。大型 repo 可改用 `--import`，由 ADO server 直接從 Git 平台拉（踩坑 46），需要環境變數 `GITEA_USER`、`GITEA_TOKEN`，來源要是 http(s) 網址（repo 的 `import_url`，省略時用 `gitea_url`）。腳本會建一個暫時的 Git 類 service endpoint，匯入結束（成功或失敗）就刪掉。**此路徑未驗證**：endpoint 型別名稱 `git` 不在官方 REST 文件的範例裡，腳本會先向 server 查詢這個型別是否存在。
+6. **上傳 secure file**（有 CD 時）：腳本不處理，只在結尾列出 yaml 引用的 secure file 名稱。第一次建置前先上傳到 **Library → Secure files**，再 `ado-authorize.sh grant --securefile <名稱> --pipelines <id>`，否則整條 pipeline 在驗證階段就失敗（踩坑 45）。
+7. **改 yaml 中與 agent 不一致的路徑**：腳本第 7 步讀本機的 `azure-pipelines.yml`（`.ci-tools.yml` 所在目錄的上一層＋repo 名稱），把 `JAVA_HOME`、`GRADLE_USER_HOME`、`NPM_CONFIG_CACHE` 和 servers.yml 該 server 的 agents 比對，不一致只警告、不改檔。
+8. **第一次建置連線跑**：`ado-run.sh --pipeline <id> -p offline=false`（踩坑 25、38），成功後再用預設的離線模式跑一次。
+9. **把新的 Gradle 版本加進** servers.yml 該 agent 的 `cached_gradle_versions`。
+
+### 換 server 的檢查清單
+
+- [ ] yaml 的 `JAVA_HOME` 與快取路徑（`GRADLE_USER_HOME`、`NPM_CONFIG_CACHE`）是新 agent 上的路徑（腳本第 7 步會比對）
+- [ ] 腳本與 yaml 裡寫死的舊 ADO 網址：腳本第 7 步會掃 `azure-pipelines.yml` 與 `bin/*.sh`，列出含 servers.yml 其他 server 主機名的位置；其他目錄要自己再找一次
+- [ ] secure file 已在新 server 上傳並授權（踩坑 45）
+- [ ] 會觸發部署的分支：在新 server 建立或移動前，先撤銷 pipeline 對部署金鑰的授權，取消自動觸發的那次後再恢復（踩坑 39）
+- [ ] Wiki **不會**跟著搬：舊 server 的 Wiki 頁面要另外複製（改既有頁面要帶 `If-Match`，踩坑 43）
+- [ ] 舊 server 上的 pipeline 停用或刪除，避免兩邊同時建置、同時部署
+
 ## 7. 測試分層與 E2E
 
 詳見 `references/e2e-layering.md`。摘要：
@@ -363,4 +397,5 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 | `${CLAUDE_PLUGIN_ROOT}/scripts/ci-triage.sh` | 首次建置失敗分類：抽出失敗類別、產生本機重跑與基準比對指令 |
 | `${CLAUDE_PLUGIN_ROOT}/scripts/ado-run.sh` | 觸發 pipeline（分支、`templateParameters`）、輪詢至完成、印出失敗步驟 log |
 | `${CLAUDE_PLUGIN_ROOT}/scripts/ado-authorize.sh` | 列出／授權／撤銷 pipeline 對佇列、repo、secure file 的使用權限，寫入後讀回比對 |
+| `${CLAUDE_PLUGIN_ROOT}/scripts/ado-bootstrap-project.sh` | 第 6A 章：依 `.ci-tools.yml` 備好專案、repo、預設分支、pipeline、授權，並比對 agent 路徑（預設只預覽；**未在真實 server 驗證**，`--import` 亦同） |
 | `${CLAUDE_PLUGIN_ROOT}/scripts/lib/ci_config.py` | 兩層設定檔的讀取器（無外部依賴） |
