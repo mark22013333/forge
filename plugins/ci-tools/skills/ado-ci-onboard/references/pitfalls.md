@@ -74,8 +74,8 @@
 
 ### 50. 套用 Patch：管理主控台開著就停止；修補後 Git SSH 服務可能沒有自動啟動
 
-- **症狀**：執行 Patch 安裝程式時直接停止，提示要先關閉管理主控台。修補完成、重開機後，Git over SSH 連不上，HTTP 仍正常。
-- **根因**：修補工具要求管理主控台（`TfsMgmt.exe`）不在執行中。Git SSH 服務 `TeamFoundationSshService` 的啟動類型可能是「手動」，修補工具不會啟動它，所以重開機後 SSH 就斷了。
+- **症狀**：執行 Patch 安裝程式時直接停止，提示要先關閉管理主控台。關閉後重新執行可完成修補，但輸出中有一行 `Skipping start of service since start mode is not set to Automatic: TeamFoundationSshService`。
+- **根因**：修補工具要求管理主控台（`TfsMgmt.exe`）不在執行中。Git SSH 服務 `TeamFoundationSshService` 的啟動類型可能是「手動」，修補工具不會啟動它，〔推論，未實測〕重開機後這個服務不會自動啟動，Git over SSH 就會斷。
 - **解法**：套用 Patch 前先關閉管理主控台。修補後檢查 SSH 服務的啟動類型，改成自動：`Set-Service TeamFoundationSshService -StartupType Automatic`，再 `Start-Service TeamFoundationSshService`。修補後的版本可在登錄 `HKLM\SOFTWARE\Microsoft\TeamFoundationServer\<版本>` 的 `PatchVersion` 確認。
 - **驗證狀態**：已遇到
 
@@ -247,7 +247,7 @@
 
 ### 45. secure file 不存在或未授權，整條 pipeline 在驗證階段就失敗
 
-- **症狀**：建置幾秒內就 completed/failed；timeline API 回 **HTTP 204**（沒有任何 record），網頁上也看不到任何步驟；即使這次的 condition 根本不會執行用到 secure file 的那個 stage，也一樣失敗。
+- **症狀**：建置幾秒內就 completed/failed；timeline API 回 **HTTP 204**（沒有任何 record）；即使這次的 condition 根本不會執行用到 secure file 的那個 stage，也一樣失敗。
 - **根因**：YAML 引用的 secure file 在 pipeline 派工前的驗證階段就會檢查。找不到或未授權時整條 pipeline 無效，錯誤只記在 `GET _apis/build/builds/<id>` 回應的 `validationResults` 裡，訊息類似「管線無效。作業 deploy: 找不到步驟 X 輸入 secureFile 參考的安全檔案 deploy-key」。
 - **解法**：建置秒失敗且 timeline 為空時，先看 build 的 `validationResults`（`scripts/ado-run.sh` 會自動印出）。搬到新 server 時，secure file 要在第一次建置前上傳並授權 pipeline（授權見第 35 條、`scripts/ado-authorize.sh`）。
 - **驗證狀態**：已驗證
