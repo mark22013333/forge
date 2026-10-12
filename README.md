@@ -67,6 +67,7 @@ claude plugin install git-tools
 - `ci-triage.sh`：從建置 log 抽出失敗的測試類別，產生本機重跑與產品基準比對指令（對 ADO 只發 GET）
 - `sync-gitea-to-ado.sh`：預設只預覽，`--apply` 才推；只快轉、分叉就停、保護分支只印指令
 - `sync-all-repos.sh`：依 `.ci-tools.yml` 同步所有 repo，依賴 repo 先推，任一 repo 分叉就全部不推
+- `ado-bootstrap-project.sh`：接上新 server／換 server 時，依 `.ci-tools.yml` 一次備好 ADO 專案、repo（預設 repo 改名）、預設分支、pipeline 與授權，並比對 yaml 與 agent 的路徑；預設只預覽，`--apply` 才寫入且每步讀回確認（僅離線測試，未在真實 server 驗證；`--import` 走 server 端匯入，同樣未驗證）
 
 **同步腳本參數（單一 repo）**
 
