@@ -162,10 +162,10 @@ for r in repos:
     print("\x1f".join([str(r["name"]), str(r.get("ado_repo") or r["name"]), str(r.get("role") or "main"),
                        str(r.get("import_url") or r.get("gitea_url") or ""), ",".join(str(b) for b in br)]))
 PY
-N_NAME=(); N_ADO=(); N_ROLE=(); N_SRC=(); N_BR=(); N_ID=(); N_REFS=()
+N_NAME=(); N_ADO=(); N_ROLE=(); N_SRC=(); N_BR=(); N_ID=(); N_REFS=(); N_PIPE=(); N_YAML=()
 while IFS=$'\x1f' read -r n a r s b; do
   [ -n "$n" ] || continue
-  N_NAME+=("$n"); N_ADO+=("$a"); N_ROLE+=("$r"); N_SRC+=("$s"); N_BR+=("$b"); N_ID+=(""); N_REFS+=("")
+  N_NAME+=("$n"); N_ADO+=("$a"); N_ROLE+=("$r"); N_SRC+=("$s"); N_BR+=("$b"); N_ID+=(""); N_REFS+=(""); N_PIPE+=(""); N_YAML+=("")
 done < "$WORK/repos.tsv"
 [ "${#N_NAME[@]}" -gt 0 ] || { echo "錯誤：.ci-tools.yml 的 repos 清單是空的" >&2; exit 1; }
 FIRST_MAIN=-1
@@ -483,12 +483,14 @@ for i in "${!N_NAME[@]}"; do
     404) echo "  ${name}：沒有 /azure-pipelines.yml${want:+（分支 ${want}）}，不建 pipeline"; continue ;;
     *) http_fail "$code" "檢查 ${name} 的 azure-pipelines.yml" ;;
   esac
+  pyjson "print(d.get('content') or '')" >| "$WORK/yaml-$i.yml"
+  N_YAML[$i]="$WORK/yaml-$i.yml"
   sf="$(pyjson "import re; print(','.join(sorted(set(re.findall(r'secureFile:\s*[\"\x27]?([^\s\"\x27#]+)', d.get('content') or '')))))")"
   [ -n "$sf" ] && SECURE_FILES="${SECURE_FILES:+$SECURE_FILES,}$sf"
   existing="$(pipe_for "${N_ID[$i]}")"
   if [ -n "$existing" ]; then
     echo "  ${name}：已有指向 /azure-pipelines.yml 的 pipeline（id ${existing}），沿用"
-    MAIN_PIPES="${MAIN_PIPES:+$MAIN_PIPES,}$existing"
+    MAIN_PIPES="${MAIN_PIPES:+$MAIN_PIPES,}$existing"; N_PIPE[$i]="$existing"
     continue
   fi
   plan "建立 pipeline「${name} CI」（folder \\，yaml /azure-pipelines.yml），建完重新列出確認（踩坑 34）"
@@ -508,46 +510,103 @@ for i in "${!N_NAME[@]}"; do
       200|201) echo "    已建立並讀回：pipeline id ${existing}" ;;
       *) echo "    建立回 HTTP ${pcode}，但重新列出已有 pipeline id ${existing}，視為成功（踩坑 34）" ;;
     esac
-    MAIN_PIPES="${MAIN_PIPES:+$MAIN_PIPES,}$existing"
+    MAIN_PIPES="${MAIN_PIPES:+$MAIN_PIPES,}$existing"; N_PIPE[$i]="$existing"
   fi
 done
 echo
 
 # ---------------------------------------------------------------- 6. 授權
 echo "== 6. 授權"
+REPO_ROOT_DIR="$(cd "$(dirname "$CONFIG")/.." && pwd)"
 auth_args=(--config "$CONFIG" --servers "$SERVERS" --project "$PROJECT")
+# ensure_auth <ado-authorize 的資源旗標> <名稱> <說明> <pipeline ids>：先 list（只發 GET）查已授權的 pipeline，只對缺的 grant
+ensure_auth() {
+  local flag="$1" res="$2" label="$3" ids="$4" out have missing="" id
+  local want_ids=()
+  out="$(bash "$AUTH" list "$flag" "$res" "${auth_args[@]}")" || exit $?
+  have="${out##*已授權的 pipeline：}"
+  IFS=',' read -r -a want_ids <<<"$ids"
+  for id in "${want_ids[@]}"; do
+    if [ "$have" = ALL ] || [[ ",$have," == *",$id,"* ]]; then continue; fi
+    missing="${missing:+$missing,}$id"
+  done
+  if [ -z "$missing" ]; then
+    echo "  ${label}：已授權 pipeline ${have}，沿用"
+    return 0
+  fi
+  echo "  ${label}：目前已授權 ${have}"
+  plan "授權 pipeline ${missing} 使用${label}"
+  if [ "$APPLY" -eq 1 ]; then bash "$AUTH" grant "$flag" "$res" --pipelines "$missing" "${auth_args[@]}" | sed 's/^/    /'; fi
+}
+# yaml_refs_repo <yaml 檔> <repo 名稱>：yaml 的 resources.repositories 有 name: <repo> 或 name: <專案>/<repo> 時印 yes
+yaml_refs_repo() {
+  python3 - "$1" "$2" <<'PY2'
+import re, sys
+lines = open(sys.argv[1], encoding="utf-8-sig", errors="replace").read().splitlines()
+want = sys.argv[2].lower()
+
+def ind(l):
+    return len(l) - len(l.lstrip(" "))
+
+def body(l):
+    return re.sub(r"\s+#.*$", "", l).strip()
+
+names, i = [], 0
+while i < len(lines):
+    if body(lines[i]) == "resources:":
+        r = ind(lines[i]); i += 1
+        while i < len(lines) and (not body(lines[i]) or ind(lines[i]) > r):
+            if body(lines[i]) == "repositories:":
+                k = ind(lines[i]); i += 1
+                while i < len(lines):
+                    b = body(lines[i])
+                    if b and (ind(lines[i]) < k or (ind(lines[i]) == k and not b.startswith("-"))):
+                        break
+                    m = re.match(r"^(?:-\s*)?name\s*:\s*(.+)$", b)
+                    if m:
+                        names.append(m.group(1).strip().strip("'\""))
+                    i += 1
+                continue
+            i += 1
+        continue
+    i += 1
+print("yes" if any(n.lower() == want or n.lower().endswith("/" + want) for n in names) else "no")
+PY2
+}
 if [ -z "$MAIN_PIPES" ]; then
   echo "  還沒有 main repo 的 pipeline，略過授權（pipeline 建好後再執行一次）"
 else
-  # ensure_auth <ado-authorize 的資源旗標> <名稱> <說明>：先 list（只發 GET）查已授權的 pipeline，只對缺的 grant
-  ensure_auth() {
-    local flag="$1" res="$2" label="$3" out have missing="" id
-    out="$(bash "$AUTH" list "$flag" "$res" "${auth_args[@]}")" || exit $?
-    have="${out##*已授權的 pipeline：}"
-    IFS=',' read -r -a want_ids <<<"$MAIN_PIPES"
-    for id in "${want_ids[@]}"; do
-      if [ "$have" = ALL ] || [[ ",$have," == *",$id,"* ]]; then continue; fi
-      missing="${missing:+$missing,}$id"
+  ensure_auth --queue "$QUEUE" "agent 佇列「${QUEUE}」（踩坑 35）" "$MAIN_PIPES"
+  for d in "${!N_NAME[@]}"; do
+    [ "${N_ROLE[$d]}" = dependency ] || continue
+    dep="${N_ADO[$d]}"; pids=""
+    # 只授權 yaml 的 resources.repositories 實際引用這個依賴 repo 的 pipeline
+    for i in "${!N_NAME[@]}"; do
+      [ -n "${N_PIPE[$i]}" ] || continue
+      yfile="${N_YAML[$i]}"; ysrc="ADO 預設分支"
+      if [ -z "$yfile" ] || [ ! -s "$yfile" ]; then
+        yfile="$REPO_ROOT_DIR/${N_NAME[$i]}/azure-pipelines.yml"; ysrc="本機"
+      fi
+      if [ ! -f "$yfile" ]; then
+        echo "  依賴 repo「${dep}」：pipeline ${N_PIPE[$i]}（${N_ADO[$i]}）的 yaml 在 ADO 與本機都讀不到，不授權"
+        continue
+      fi
+      if [ "$(yaml_refs_repo "$yfile" "$dep")" = yes ]; then
+        echo "  依賴 repo「${dep}」：pipeline ${N_PIPE[$i]}（${N_ADO[$i]}）的 yaml（${ysrc}）在 resources.repositories 引用它"
+        pids="${pids:+$pids,}${N_PIPE[$i]}"
+      else
+        echo "  依賴 repo「${dep}」：pipeline ${N_PIPE[$i]}（${N_ADO[$i]}）的 yaml（${ysrc}）沒有引用它，不授權"
+      fi
     done
-    if [ -z "$missing" ]; then
-      echo "  ${label}：已授權 pipeline ${have}，沿用"
-      return 0
+    if [ -n "$pids" ]; then
+      ensure_auth --repo "$dep" "依賴 repo「${dep}」" "$pids"
     fi
-    echo "  ${label}：目前已授權 ${have}"
-    plan "授權 pipeline ${missing} 使用${label}"
-    if [ "$APPLY" -eq 1 ]; then bash "$AUTH" grant "$flag" "$res" --pipelines "$missing" "${auth_args[@]}" | sed 's/^/    /'; fi
-  }
-  ensure_auth --queue "$QUEUE" "agent 佇列「${QUEUE}」（踩坑 35）"
-  for i in "${!N_NAME[@]}"; do
-    [ "${N_ROLE[$i]}" = dependency ] || continue
-    ensure_auth --repo "${N_ADO[$i]}" "依賴 repo「${N_ADO[$i]}」"
   done
 fi
 echo
 
 # ---------------------------------------------------------------- 7. 環境一致性（只讀）
 echo "== 7. 環境一致性（只讀，不改檔）"
-REPO_ROOT_DIR="$(cd "$(dirname "$CONFIG")/.." && pwd)"
 MAIN_NAMES=()
 for i in "${!N_NAME[@]}"; do [ "${N_ROLE[$i]}" = main ] && MAIN_NAMES+=("${N_NAME[$i]}"); done
 python3 - "$HERE/lib" "$SERVERS" "$SERVER_NAME" "$REPO_ROOT_DIR" ${MAIN_NAMES[@]+"${MAIN_NAMES[@]}"} >| "$WORK/env.txt" <<'PY'
@@ -624,21 +683,29 @@ for name in names:
     d = os.path.join(root, name)
     y = os.path.join(d, "azure-pipelines.yml")
     if not os.path.isfile(y):
-        print(f"INFO\t{name}：本機找不到 {y}，跳過環境檢查")
+        print(f"INFO\t{name}/azure-pipelines.yml：找不到（{y}），略過")
         continue
     lines = open(y, encoding="utf-8-sig", errors="replace").read().splitlines()
-    found = False
+    found = {}
     for no, key, val in find_vars(lines):
-        found = True
-        if "$(" in val or "${{" in val or "$[" in val:
-            print(f"INFO\t{name}/azure-pipelines.yml:{no} {key} 由變數或參數決定（{val}），不比對")
+        found.setdefault(key, []).append((no, val))
+    summary = []
+    for key in ("JAVA_HOME", "GRADLE_USER_HOME", "NPM_CONFIG_CACHE"):
+        if key not in found:
+            summary.append(f"{key} 未設定")
             continue
-        if not expect[key]:
-            print(f"WARN\t{name}/azure-pipelines.yml:{no} {key}={val}，但 servers.yml 的 {server} agents 沒有對應路徑可比對")
-        elif norm(val) not in expect[key]:
-            print(f"WARN\t{name}/azure-pipelines.yml:{no} {key}={val} 與 servers.yml 的 {server} agents 不一致（agents：{'、'.join(sorted(expect[key].values()))}）")
-    if not found:
-        print(f"INFO\t{name}/azure-pipelines.yml 沒有寫 JAVA_HOME、GRADLE_USER_HOME、NPM_CONFIG_CACHE")
+        for no, val in found[key]:
+            if "$(" in val or "${{" in val or "$[" in val:
+                summary.append(f"{key}＝{val}（由變數或參數決定，不比對）")
+            elif not expect[key]:
+                summary.append(f"{key}＝{val}（servers.yml 沒有對應路徑，無法比對）")
+                print(f"WARN\t{name}/azure-pipelines.yml:{no} {key}={val}，但 servers.yml 的 {server} agents 沒有對應路徑可比對")
+            elif norm(val) in expect[key]:
+                summary.append(f"{key}＝{val}（與 agent 一致）")
+            else:
+                summary.append(f"{key}＝{val}（與 agent 不一致）")
+                print(f"WARN\t{name}/azure-pipelines.yml:{no} {key}={val} 與 servers.yml 的 {server} agents 不一致（agents：{'、'.join(sorted(expect[key].values()))}）")
+    print(f"INFO\t{name}/azure-pipelines.yml：" + "、".join(summary))
     files = [y] + sorted(glob.glob(os.path.join(d, "bin", "*.sh")))
     for f in files:
         for no, line in enumerate(open(f, encoding="utf-8-sig", errors="replace").read().splitlines(), 1):

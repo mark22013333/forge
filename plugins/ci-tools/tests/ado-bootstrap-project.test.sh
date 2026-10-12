@@ -76,7 +76,13 @@ r refs-main.json '{"count":1,"value":[{"name":"refs/heads/main"}]}'
 r main-uat.json '{"id":"rid-main","name":"app-main","defaultBranch":"refs/heads/uat"}'
 r main-main.json '{"id":"rid-main","name":"app-main","defaultBranch":"refs/heads/main"}'
 r core-main.json '{"id":"rid-core","name":"core-lib","defaultBranch":"refs/heads/main"}'
-r items.json '{"path":"/azure-pipelines.yml","content":"steps:\n- task: DownloadSecureFile@1\n  inputs:\n    secureFile: deploy.key\n"}'
+r items.json '{"path":"/azure-pipelines.yml","content":"resources:\n  repositories:\n  - repository: core\n    type: git\n    name: proj-x/core-lib   # 依賴 repo\nsteps:\n- task: DownloadSecureFile@1\n  inputs:\n    secureFile: deploy.key\n"}'
+r items-noref.json '{"path":"/azure-pipelines.yml","content":"resources:\n  repositories:\n  - repository: tools\n    type: git\n    name: proj-x/core-lib-tools\nsteps:\n- script: echo web\n"}'
+r repos-two.json '{"value":[{"id":"rid-main","name":"app-main","defaultBranch":"refs/heads/main"},{"id":"rid-web","name":"app-web","defaultBranch":"refs/heads/main"},{"id":"rid-core","name":"core-lib","defaultBranch":"refs/heads/main"}]}'
+r web-main.json '{"id":"rid-web","name":"app-web","defaultBranch":"refs/heads/main"}'
+r pipes-79.json '{"count":2,"value":[{"id":7,"name":"app-main CI"},{"id":9,"name":"app-web CI"}]}'
+r pipe-9.json '{"id":9,"name":"app-web CI","configuration":{"type":"yaml","path":"/azure-pipelines.yml","repository":{"id":"rid-web","type":"azureReposGit"}}}'
+r perm-79.json '{"pipelines":[{"id":7,"authorized":true},{"id":9,"authorized":true}]}'
 r pipes-none.json '{"count":0,"value":[]}'
 r pipes-7.json '{"count":1,"value":[{"id":7,"name":"app-main CI"}]}'
 r pipes-8.json '{"count":1,"value":[{"id":8,"name":"app-main CI"}]}'
@@ -168,6 +174,7 @@ check "預告預設 repo 改名給第一個 main" 'echo "$OUT" | grep -q "改名
 check "預告建立依賴 repo" 'echo "$OUT" | grep -q "建立 repo「core-lib」（dependency）"'
 check "環境檢查：JAVA_HOME 與 agents 不一致時警告" 'echo "$OUT" | grep -q "警告：app-main/azure-pipelines.yml:2 JAVA_HOME=C:\\\\Java\\\\jdk-21 與 servers.yml 的 ex-ado agents 不一致"'
 check "環境檢查：GRADLE_USER_HOME 一致時不警告" '! echo "$OUT" | grep -q "GRADLE_USER_HOME=.*不一致"'
+check "環境檢查：一致的也印出比對結果（map 形式）" 'echo "$OUT" | grep -q "app-main/azure-pipelines.yml：JAVA_HOME＝C:\\\\Java\\\\jdk-21（與 agent 不一致）、GRADLE_USER_HOME＝D:\\\\cache\\\\gradle（與 agent 一致）、NPM_CONFIG_CACHE 未設定"'
 check "環境檢查：列出含其他 server 主機名的位置" 'echo "$OUT" | grep -q "app-main/bin/deploy.sh:2 含其他 server（old-ado）的主機 old-ado.example"'
 check "提示用 sync-all-repos.sh 推送" 'echo "$OUT" | grep -q "sync-all-repos.sh --config"'
 check "ADO 權杖經 stdin、不在參數、不印出" 'grep -q secret-ado-token-123 "$FAKE_STDIN" && ! grep -q secret-ado-token-123 "$FAKE_ARGV" && ! echo "$OUT" | grep -q secret-ado-token-123'
@@ -357,8 +364,53 @@ echo "$OUT" | sed -n '/== 7/,/^$/p' | sed 's/^/    | /'
 check "exit 0" '[ $RC -eq 0 ]'
 check "不再誤報「沒有寫」" '! echo "$OUT" | grep -q "沒有寫 JAVA_HOME"'
 check "清單形式 JAVA_HOME 與 agents 相同 → 不警告" '! echo "$OUT" | grep -q "JAVA_HOME="'
+check "清單形式：一致時印出「與 agent 一致」，沒值的印「未設定」" 'echo "$OUT" | grep -q "JAVA_HOME＝C:\\\\Java\\\\jdk-17（與 agent 一致）" && echo "$OUT" | grep -q "NPM_CONFIG_CACHE 未設定"'
 check "清單形式 GRADLE_USER_HOME 不同 → 警告（行號指向 value 行、值已去引號）" 'echo "$OUT" | grep -q "警告：app-main/azure-pipelines.yml:6 GRADLE_USER_HOME=D:\\\\other-cache 與 servers.yml 的 ex-ado agents 不一致"'
 check "沒有 value 的清單項目不會吃到下一個項目的 value" '! echo "$OUT" | grep -q "NPM_CONFIG_CACHE=x"'
+
+# ---------------------------------------------------------------- 情境 10：兩個 main repo，只有一個 yaml 引用依賴 repo
+mkdir -p "$T/ws3/app-main"
+cat >| "$T/ws3/app-main/.ci-tools.yml" <<'EOF'
+server: ex-ado
+ado_project: proj-x
+repos:
+  - name: app-main
+    role: main
+    gitea_url: https://git.example/team/app-main.git
+    branches: [main]
+  - name: app-web
+    role: main
+    gitea_url: https://git.example/team/app-web.git
+    branches: [main]
+  - name: core-lib
+    role: dependency
+    gitea_url: https://git.example/team/core-lib.git
+    branches: [main]
+EOF
+scenario "情境 10：依賴 repo 只授權給 yaml 有引用它的 pipeline" \
+  "$R_PROJ" \
+  $'GET\t/proj-x/_apis/git/repositories?\t200\trepos-two.json' \
+  $'GET\t/refs?filter=\t200\trefs-main.json' \
+  $'GET\t/refs?api-version\t200\trefs-2.json' \
+  $'GET\t/git/repositories/rid-main?\t200\tmain-main.json' \
+  $'GET\t/git/repositories/rid-web?\t200\tweb-main.json' \
+  $'GET\t/git/repositories/rid-core?\t200\tcore-main.json' \
+  $'GET\t/git/repositories/rid-main/items?\t200\titems.json' \
+  $'GET\t/git/repositories/rid-web/items?\t200\titems-noref.json' \
+  $'GET\t/_apis/pipelines?\t200\tpipes-79.json' \
+  $'GET\t/_apis/pipelines/7?\t200\tpipe-7.json' \
+  $'GET\t/_apis/pipelines/9?\t200\tpipe-9.json' \
+  "$R_Q" "$R_CORE" "$R_PERM_PATCH" \
+  $'GET\t/pipelinePermissions/queue/\t200\tperm-none.json,perm-79.json' \
+  $'GET\t/pipelinePermissions/repository/\t200\tperm-none.json,perm-7.json'
+OUT="$(bash "$BOOT" --apply --config "$T/ws3/app-main/.ci-tools.yml" --servers "$T/servers.yml" --poll 0 2>&1)"; RC=$?
+echo "$OUT" | sed -n '/== 6/,/^$/p;/== 7/,/^$/p' | sed 's/^/    | /'
+check "exit 0" '[ $RC -eq 0 ]'
+check "佇列授權給兩個 pipeline" 'grep "^PATCH	.*/pipelinePermissions/queue/9?" "$FAKE_LOG" | cut -f3 | python3 -c "import json,sys; assert sorted(p[\"id\"] for p in json.load(sys.stdin)[\"pipelines\"])==[7,9]"'
+check "依賴 repo 只授權給 pipeline 7" 'grep "^PATCH	.*/pipelinePermissions/repository/" "$FAKE_LOG" | cut -f3 | python3 -c "import json,sys; assert [p[\"id\"] for p in json.load(sys.stdin)[\"pipelines\"]]==[7]"'
+check "說明 pipeline 9 沒有引用（名稱只是前綴相同也不算）" 'echo "$OUT" | grep -q "pipeline 9（app-web）的 yaml（ADO 預設分支）沒有引用它，不授權"'
+check "說明 pipeline 7 有引用" 'echo "$OUT" | grep -q "pipeline 7（app-main）的 yaml（ADO 預設分支）在 resources.repositories 引用它"'
+check "本機沒有 yaml 時印「找不到，略過」" 'echo "$OUT" | grep -q "app-main/azure-pipelines.yml：找不到" && echo "$OUT" | grep -q "app-web/azure-pipelines.yml：找不到"'
 
 echo
 echo "結果：通過 ${PASS}、失敗 ${FAIL}"
