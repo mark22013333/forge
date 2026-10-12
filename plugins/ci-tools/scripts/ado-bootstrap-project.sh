@@ -519,12 +519,28 @@ auth_args=(--config "$CONFIG" --servers "$SERVERS" --project "$PROJECT")
 if [ -z "$MAIN_PIPES" ]; then
   echo "  還沒有 main repo 的 pipeline，略過授權（pipeline 建好後再執行一次）"
 else
-  plan "授權 pipeline ${MAIN_PIPES} 使用 agent 佇列「${QUEUE}」（踩坑 35）"
-  if [ "$APPLY" -eq 1 ]; then bash "$AUTH" grant --queue "$QUEUE" --pipelines "$MAIN_PIPES" "${auth_args[@]}" | sed 's/^/    /'; fi
+  # ensure_auth <ado-authorize 的資源旗標> <名稱> <說明>：先 list（只發 GET）查已授權的 pipeline，只對缺的 grant
+  ensure_auth() {
+    local flag="$1" res="$2" label="$3" out have missing="" id
+    out="$(bash "$AUTH" list "$flag" "$res" "${auth_args[@]}")" || exit $?
+    have="${out##*已授權的 pipeline：}"
+    IFS=',' read -r -a want_ids <<<"$MAIN_PIPES"
+    for id in "${want_ids[@]}"; do
+      if [ "$have" = ALL ] || [[ ",$have," == *",$id,"* ]]; then continue; fi
+      missing="${missing:+$missing,}$id"
+    done
+    if [ -z "$missing" ]; then
+      echo "  ${label}：已授權 pipeline ${have}，沿用"
+      return 0
+    fi
+    echo "  ${label}：目前已授權 ${have}"
+    plan "授權 pipeline ${missing} 使用${label}"
+    if [ "$APPLY" -eq 1 ]; then bash "$AUTH" grant "$flag" "$res" --pipelines "$missing" "${auth_args[@]}" | sed 's/^/    /'; fi
+  }
+  ensure_auth --queue "$QUEUE" "agent 佇列「${QUEUE}」（踩坑 35）"
   for i in "${!N_NAME[@]}"; do
     [ "${N_ROLE[$i]}" = dependency ] || continue
-    plan "授權 pipeline ${MAIN_PIPES} 使用依賴 repo「${N_ADO[$i]}」"
-    if [ "$APPLY" -eq 1 ]; then bash "$AUTH" grant --repo "${N_ADO[$i]}" --pipelines "$MAIN_PIPES" "${auth_args[@]}" | sed 's/^/    /'; fi
+    ensure_auth --repo "${N_ADO[$i]}" "依賴 repo「${N_ADO[$i]}」"
   done
 fi
 echo
@@ -571,7 +587,39 @@ for n, s in servers.items():
     for h in hosts(s) - mine:
         others[h] = n
 
-pat = re.compile(r"^\s*-?\s*(JAVA_HOME|GRADLE_USER_HOME|NPM_CONFIG_CACHE)\s*:\s*(.+?)\s*(#.*)?$")
+KEYS = "JAVA_HOME|GRADLE_USER_HOME|NPM_CONFIG_CACHE"
+# map 形式：  JAVA_HOME: 'C:\x'
+pat_map = re.compile(r"^\s*(?:-\s*)?(" + KEYS + r")\s*:\s*(.+?)\s*(#.*)?$")
+# 清單形式：  - name: JAVA_HOME   下一行（同一個清單項目內）  value: 'C:\x'
+pat_name = re.compile(r"^(\s*)-\s*name\s*:\s*[\"']?(" + KEYS + r")[\"']?\s*(#.*)?$")
+pat_value = re.compile(r"^\s*value\s*:\s*(.+?)\s*(#.*)?$")
+
+def indent(line):
+    return len(line) - len(line.lstrip(" "))
+
+def find_vars(lines):
+    """回傳 [(行號, key, 值)]：值已去掉引號"""
+    out = []
+    for i, line in enumerate(lines):
+        m = pat_map.match(line)
+        if m:
+            out.append((i + 1, m.group(1), m.group(2).strip().strip("'\"")))
+            continue
+        m = pat_name.match(line)
+        if not m:
+            continue
+        dash = len(m.group(1))
+        for j in range(i + 1, len(lines)):
+            nxt = lines[j]
+            if not nxt.strip() or nxt.lstrip().startswith("#"):
+                continue
+            if indent(nxt) <= dash:      # 下一個清單項目或上一層：這個項目沒有 value
+                break
+            v = pat_value.match(nxt)
+            if v:
+                out.append((j + 1, m.group(2), v.group(1).strip().strip("'\"")))
+                break
+    return out
 for name in names:
     d = os.path.join(root, name)
     y = os.path.join(d, "azure-pipelines.yml")
@@ -580,11 +628,8 @@ for name in names:
         continue
     lines = open(y, encoding="utf-8-sig", errors="replace").read().splitlines()
     found = False
-    for no, line in enumerate(lines, 1):
-        m = pat.match(line)
-        if not m: continue
+    for no, key, val in find_vars(lines):
         found = True
-        key, val = m.group(1), m.group(2).strip().strip("'\"")
         if "$(" in val or "${{" in val or "$[" in val:
             print(f"INFO\t{name}/azure-pipelines.yml:{no} {key} 由變數或參數決定（{val}），不比對")
             continue

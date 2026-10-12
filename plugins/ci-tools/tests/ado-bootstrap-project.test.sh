@@ -85,6 +85,7 @@ r pipe-8.json '{"id":8,"name":"app-main CI","configuration":{"type":"yaml","path
 r queues.json '{"count":1,"value":[{"id":9,"name":"Default"}]}'
 r perm-7.json '{"pipelines":[{"id":7,"authorized":true}]}'
 r perm-8.json '{"pipelines":[{"id":8,"authorized":true}]}'
+r perm-none.json '{"pipelines":[]}'
 r types-git.json '{"count":1,"value":[{"name":"git","displayName":"Other Git"}]}'
 r ep.json '{"id":"ep-1","name":"ci-tools-import-app-main"}'
 r ir.json '{"importRequestId":5,"status":"queued"}'
@@ -209,7 +210,7 @@ scenario "情境 3：--apply 預設分支不對要 PATCH；pipeline 已存在不
   $'GET\t/_apis/pipelines?\t200\tpipes-7.json' \
   $'GET\t/_apis/pipelines/7?\t200\tpipe-7.json' \
   "$R_Q" "$R_CORE" "$R_PERM_PATCH" \
-  $'GET\t/pipelinePermissions/\t200\tperm-7.json'
+  $'GET\t/pipelinePermissions/\t200\tperm-none.json,perm-7.json,perm-none.json,perm-7.json'
 OUT="$(bash "$BOOT" --apply "${args[@]}" 2>&1)"; RC=$?
 echo "$OUT" | sed 's/^/    | /'
 check "exit 0" '[ $RC -eq 0 ]'
@@ -219,6 +220,33 @@ check "pipeline 已存在（路徑不帶 / 也認得）→ 不 POST" '! grep -q 
 check "授權佇列與依賴 repo（各一次 PATCH）" '[ "$(grep -c "^PATCH	.*/pipelinePermissions/queue/9?" "$FAKE_LOG")" -eq 1 ] && [ "$(grep -c "^PATCH	.*/pipelinePermissions/repository/proj-guid-1.rid-core?" "$FAKE_LOG")" -eq 1 ]'
 check "名稱以 .git 結尾的 repo 會警告" 'echo "$OUT" | grep -q "警告：repo 名稱以 .git 結尾：core-lib.git"'
 check "secure file 只提示、不處理" 'echo "$OUT" | grep -q "secure file：deploy.key" && ! grep -q "securefiles" "$FAKE_LOG"'
+
+R_AUTHED=(
+  "$R_PROJ"
+  $'GET\t/proj-x/_apis/git/repositories?\t200\trepos-ok.json'
+  $'GET\t/refs?filter=\t200\trefs-main.json'
+  $'GET\t/refs?api-version\t200\trefs-2.json'
+  $'GET\t/git/repositories/rid-main?\t200\tmain-main.json'
+  $'GET\t/git/repositories/rid-core?\t200\tcore-main.json'
+  $'GET\t/git/repositories/rid-main/items?\t200\titems.json'
+  $'GET\t/_apis/pipelines?\t200\tpipes-7.json'
+  $'GET\t/_apis/pipelines/7?\t200\tpipe-7.json'
+  "$R_Q" "$R_CORE" "$R_PERM_PATCH"
+  $'GET\t/pipelinePermissions/\t200\tperm-7.json'
+)
+for mode in preview apply; do
+  scenario "情境 3b（${mode}）：佇列與依賴 repo 都已授權 → 不發 PATCH" "${R_AUTHED[@]}"
+  if [ "$mode" = apply ]; then OUT="$(bash "$BOOT" --apply "${args[@]}" 2>&1)"; RC=$?; else OUT="$(bash "$BOOT" "${args[@]}" 2>&1)"; RC=$?; fi
+  echo "$OUT" | sed -n '/== 6/,/^$/p' | sed 's/^/    | /'
+  check "exit 0" '[ $RC -eq 0 ]'
+  check "沒有任何 PATCH" '! grep -q "^PATCH" "$FAKE_LOG"'
+  check "有先查授權（佇列與 repo 各一次 GET）" '[ "$(grep -c "^GET	.*/pipelinePermissions/" "$FAKE_LOG")" -eq 2 ]'
+  check "印出已授權、沿用" '[ "$(echo "$OUT" | grep -c "已授權 pipeline 7，沿用")" -eq 2 ] && ! echo "$OUT" | grep -q "將授權"'
+done
+
+scenario "情境 3c（預覽）：只缺授權時才預告授權" "${R_AUTHED[@]/perm-7.json/perm-none.json}"
+OUT="$(bash "$BOOT" "${args[@]}" 2>&1)"; RC=$?
+check "exit 0、預告授權 pipeline 7、沒有 PATCH" '[ $RC -eq 0 ] && [ "$(echo "$OUT" | grep -c "\[預覽\] 將授權 pipeline 7 使用")" -eq 2 ] && ! grep -q "^PATCH" "$FAKE_LOG"'
 
 # ---------------------------------------------------------------- 情境 4：pipeline POST 回 401，但列表已有
 R_OKREPOS=(
@@ -236,7 +264,7 @@ scenario "情境 4：建立 pipeline 回 401，重新列出已有 → 視為成�
   $'GET\t/_apis/pipelines/8?\t200\tpipe-8.json' \
   $'POST\t/_apis/pipelines?\t401\tempty.json' \
   "$R_Q" "$R_CORE" "$R_PERM_PATCH" \
-  $'GET\t/pipelinePermissions/\t200\tperm-8.json'
+  $'GET\t/pipelinePermissions/\t200\tperm-none.json,perm-8.json,perm-none.json,perm-8.json'
 OUT="$(bash "$BOOT" --apply "${args[@]}" 2>&1)"; RC=$?
 echo "$OUT" | sed 's/^/    | /'
 check "exit 0 並說明視為成功" '[ $RC -eq 0 ] && echo "$OUT" | grep -q "重新列出已有 pipeline id 8，視為成功"'
@@ -304,6 +332,33 @@ scenario "情境 8：--import 預覽只發 GET" \
 OUT="$(GITEA_USER=gituser GITEA_TOKEN=secret-git-token-789 bash "$BOOT" --import "${args[@]}" 2>&1)"; RC=$?
 check "exit 0 且只發 GET" '[ $RC -eq 0 ] && ! grep -qvE "^GET	" "$FAKE_LOG"'
 check "預告匯入" 'echo "$OUT" | grep -q "\[預覽\] 將建立暫時的 Git service endpoint → 匯入 https://git.example/team/app-main.git"'
+
+# ---------------------------------------------------------------- 情境 9：清單形式的 variables
+mkdir -p "$T/ws2/app-main"
+sed 's/^repos:/repos:/' "$T/ws/app-main/.ci-tools.yml" >| "$T/ws2/app-main/.ci-tools.yml"
+cat >| "$T/ws2/app-main/azure-pipelines.yml" <<'EOF'
+variables:
+  - name: JAVA_HOME
+    value: 'C:\Java\jdk-17'
+  - name: GRADLE_USER_HOME
+    # 共用快取
+    value: "D:\other-cache"
+  - name: NPM_CONFIG_CACHE
+  - name: unrelated
+    value: x
+steps:
+- script: echo build
+EOF
+scenario "情境 9：清單形式（- name: / value:）的變數也要比對" \
+  $'GET\t/_apis/projects/proj-x?\t404\tempty.json' \
+  $'GET\t/_apis/process/processes?\t200\tprocesses.json'
+OUT="$(bash "$BOOT" --config "$T/ws2/app-main/.ci-tools.yml" --servers "$T/servers.yml" 2>&1)"; RC=$?
+echo "$OUT" | sed -n '/== 7/,/^$/p' | sed 's/^/    | /'
+check "exit 0" '[ $RC -eq 0 ]'
+check "不再誤報「沒有寫」" '! echo "$OUT" | grep -q "沒有寫 JAVA_HOME"'
+check "清單形式 JAVA_HOME 與 agents 相同 → 不警告" '! echo "$OUT" | grep -q "JAVA_HOME="'
+check "清單形式 GRADLE_USER_HOME 不同 → 警告（行號指向 value 行、值已去引號）" 'echo "$OUT" | grep -q "警告：app-main/azure-pipelines.yml:6 GRADLE_USER_HOME=D:\\\\other-cache 與 servers.yml 的 ex-ado agents 不一致"'
+check "沒有 value 的清單項目不會吃到下一個項目的 value" '! echo "$OUT" | grep -q "NPM_CONFIG_CACHE=x"'
 
 echo
 echo "結果：通過 ${PASS}、失敗 ${FAIL}"
