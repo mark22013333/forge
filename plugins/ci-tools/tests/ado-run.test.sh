@@ -78,6 +78,14 @@ cat >| "$T/r/timeline-timeout.json" <<'EOF'
 EOF
 printf 'uploaded 140/210\nUPLOAD-TAIL-LINE\n' >| "$T/r/log9.txt"
 echo '{"message":"unauthorized"}' >| "$T/r/err.json"
+# 驗證階段失敗：build 帶 validationResults（error 與 warning 各一），timeline 回 204 空內容
+cat >| "$T/r/b-invalid.json" <<'EOF'
+{"id":101,"status":"completed","result":"failed","validationResults":[
+ {"result":"error","message":"VALIDATION-ERR-MSG secureFile deploy-key"},
+ {"result":"warning","message":"VALIDATION-WARN-MSG"}]}
+EOF
+echo '{"id":101,"status":"completed","result":"succeeded","validationResults":[{"result":"error","message":"SHOULD-NOT-PRINT"}]}' >| "$T/r/b-ok-warn.json"
+: >| "$T/r/empty.txt"
 
 # 設定檔（example 值）
 cat >| "$T/servers.yml" <<'EOF'
@@ -141,6 +149,20 @@ check "exit 2" '[ $RC -eq 2 ]'
 check "印出 job 層級的逾時訊息" 'echo "$OUT" | grep -q "\[Job canceled\] deploy：JOB-TIMEOUT-MSG"'
 check "被取消的步驟也抓 log" 'echo "$OUT" | grep -q "canceled 的步驟：upload（log 9）" && echo "$OUT" | grep -q "UPLOAD-TAIL-LINE"'
 check "不再誤報「沒有失敗或被取消的步驟」" '! echo "$OUT" | grep -q "沒有失敗或被取消的步驟"'
+
+scenario "情境 2c：驗證階段失敗 → 印出 validationResults，timeline 204 不當成連線錯誤" "$R_RUN" $'GET\t/build/builds/101?\t200\tb-invalid.json' $'GET\t/builds/101/timeline\t204\tempty.txt'
+OUT="$(bash "$RUN" "${args[@]}" --pipeline 7 2>&1)"; RC=$?
+echo "$OUT" | sed 's/^/    | /'
+check "exit 2（建置失敗，不是連線錯誤的 1）" '[ $RC -eq 2 ]'
+check "印出 error 等級的驗證訊息" 'echo "$OUT" | grep -q "\[驗證錯誤\] VALIDATION-ERR-MSG secureFile deploy-key"'
+check "warning 等級的驗證訊息不印" '! echo "$OUT" | grep -q "VALIDATION-WARN-MSG"'
+check "說明 timeline 為空、派工前就失敗" 'echo "$OUT" | grep -q "timeline 為空：建置在派工前就失敗，見上方驗證訊息"'
+check "不再印「取得 timeline 失敗」" '! echo "$OUT" | grep -q "取得 timeline 失敗"'
+check "沒有去抓任何 log" '! grep -q "/logs/" "$FAKE_LOG"'
+
+scenario "情境 2d：成功的建置不印驗證訊息" "$R_RUN" $'GET\t/build/builds/101?\t200\tb-ok-warn.json'
+OUT="$(bash "$RUN" "${args[@]}" --pipeline 7 2>&1)"; RC=$?
+check "exit 0 且沒有驗證訊息段落" '[ $RC -eq 0 ] && ! echo "$OUT" | grep -q "validationResults" && ! echo "$OUT" | grep -q SHOULD-NOT-PRINT'
 
 scenario "情境 3：觸發回 401 → 說明權杖範圍" $'POST\t/_apis/pipelines/7/runs\t401\terr.json'
 OUT="$(bash "$RUN" "${args[@]}" --pipeline 7 2>&1)"; RC=$?

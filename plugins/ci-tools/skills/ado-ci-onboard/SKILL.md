@@ -7,7 +7,7 @@ description: 引導把自架 Azure DevOps Server（ADO）接上既有 Gitea 專�
 
 把既有 Gitea 專案接上自架 Azure DevOps Server（以下簡稱 ADO）的 CI。Gitea 仍是主要 repo，ADO 只當 CI 鏡像。
 
-本 skill 的內容來自三次實際導入：第一次從零安裝 Server，第二次接在已經裝好的同一台 Server 上（Gradle 8.14.3、主 repo＋依賴 repo），第三次也接在同一台 Server 上（Gradle 7.5.1、主 repo＋依賴 repo＋另一個獨立 repo），並做了從 Windows agent 經 SSH 部署到 Linux VM 的 CD（第 9 章）。踩過的坑整理在 `references/pitfalls.md`，每條都有驗證狀態。
+本 skill 的內容來自四次實際導入：第一次從零安裝 Server，第二次接在已經裝好的同一台 Server 上（Gradle 8.14.3、主 repo＋依賴 repo），第三次也接在同一台 Server 上（Gradle 7.5.1、主 repo＋依賴 repo＋另一個獨立 repo），並做了從 Windows agent 經 SSH 部署到 Linux VM 的 CD（第 9 章）；第四次在一台全新的 Windows Server 2022 上安裝 Azure DevOps Server 25H2，並把既有專案的 CI／CD 搬過去。踩過的坑整理在 `references/pitfalls.md`，每條都有驗證狀態。
 
 ---
 
@@ -126,10 +126,13 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 
 1. 選 **Express** 版本。
 2. **SQL Server 先手動安裝**，服務帳戶用虛擬帳戶 `NT Service\MSSQL$<執行個體名稱>`，不要讓 ADO 精靈用 NetworkService 代裝（踩坑 1）。安裝卡在 RebootRequiredCheck 時加 `/SKIPRULES=RebootRequiredCheck`（踩坑 2）。
-3. ADO 精靈選「使用現有執行個體」。
+3. ADO 精靈選「使用現有執行個體」。部署類型選「**新的部署 - 進階**」，不要選「現有的部署」（那是資料庫已存在時用的）；SQL 執行個體欄位寫 `.\<執行個體>` 或 `localhost\<執行個體>`，只寫執行個體名稱會被當成電腦名稱（踩坑 47）。
 4. **防火牆**：確認網卡的網路類型。若是「公用」，精靈建的規則不會生效，改成「私人」或另建限定來源網段（例：`192.0.2.0/24`）的規則（踩坑 3）。
 5. **連接埠**：記下精靈設定的連接埠，寫進 `servers.yml` 的 `url`。
 6. **IIS 基本驗證**：停用，否則所有 PAT 都會 401（踩坑 5）。
+7. **公用 URL**：預設是主機的電腦名稱，主機在雲端或工作群組時用戶端常解析不到。安裝時或之後在管理主控台「變更公用 URL」改成用戶端連得到的 IP 或 FQDN（踩坑 49）。
+8. **工作群組主機的帳號**：ADO 使用者就是主機上的本機 Windows 帳號，先在主機建帳號再到 ADO 加群組，登入與人員選取器都寫 `<主機名>\<帳號>`；非英文介面的內建群組名稱會被翻譯（踩坑 48）。
+9. **套用 Patch**：先關閉管理主控台（`TfsMgmt.exe`），否則修補工具會停止；修補後確認 Git SSH 服務 `TeamFoundationSshService` 的啟動類型是自動，否則重開機後 SSH 會斷（踩坑 50）。
 
 ## 2. 安裝 agent
 
@@ -140,6 +143,7 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
    - agent 以 NetworkService 執行時沒有使用者資料夾，npm 快取要指到可寫路徑（`NPM_CONFIG_CACHE`，踩坑 7）。
    - agent 服務的 PATH 沒有 git，腳本步驟要用 `<agent 目錄>\externals\git\cmd\git.exe`（踩坑 6）。
 5. 把 JDK 路徑、`GRADLE_USER_HOME`、npm 快取路徑記進 `servers.yml` 的 `agents`，之後每個專案共用。
+6. **agent 與 ADO 同一台**（踩坑 51）：`config.cmd` 的驗證類型用預設的 Integrated（目前登入的 Windows 帳號），不需要 PAT；裝在別台才需要 PAT。agent 會自動偵測已安裝的 JDK 並登記 `jdk_17_x64` 等能力（不看 `JAVA_HOME`），`demands` 可直接用。agent 以 NETWORK SERVICE 執行時，共用快取目錄要給它修改權限（`icacls <目錄> /grant "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M"`；此項為預防，**未驗證**）。
 
 ## 3. 建立 ADO 專案與匯入 repo（Gitea → ADO）
 
@@ -167,6 +171,7 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 3. **預設 repo 改名**：建專案會自帶一個與專案同名的 repo。名稱不符時先 `GET $ADO/<專案>/_apis/git/repositories?api-version=6.0` 取得它的 `id`，再 `PATCH $ADO/<專案>/_apis/git/repositories/<id>?api-version=6.0`，body `{"name": "<主 repo 名稱>"}`。
 4. **依賴 repo**：主 repo 的 `settings.gradle` 引用同層的其他 repo（例：核心模組）時，另外建：`POST $ADO/<專案>/_apis/git/repositories?api-version=6.0`，body `{"name": "product-core", "project": {"id": "<專案 id>"}}`。
 5. 每個 repo 都寫進 `.ci-tools.yml` 的 `repos`（主 repo `role: main`，其餘 `role: dependency`）。
+6. **大型 repo 可用 ADO 的「匯入存放庫」**（踩坑 46）：由 ADO server 直接從 Git 平台拉，不經過開發者電腦或 VPN。注意入口：Repos 上方 repo 下拉選單的「匯入存放庫」一律**新建** repo（名稱預設取來源網址最後一段，含 `.git`）；要匯入既有的空 repo，得在那個 repo 的頁面上按「匯入」。匯入會帶入所有分支、預設分支沿用來源，之後照 3.2 第 4 步改預設分支。
 
 ### 3.2 推送與預設分支
 
@@ -226,11 +231,12 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/scripts/ado-run.sh" --config .ci-tools.yml --pipeline "<pipeline 名稱或 id>" --branch main -p offline=false
-# 輪詢到完成；失敗時印出失敗步驟名稱與 log 末段。--no-wait 只觸發不等待
+# 輪詢到完成；失敗時印出驗證訊息（validationResults）、失敗步驟名稱與 log 末段。--no-wait 只觸發不等待
 ```
 
 判讀時注意：
 
+- 建置幾秒內就 failed、timeline 回 HTTP 204（沒有任何 record）：pipeline 在派工前的驗證階段就失敗，原因在 `GET .../_apis/build/builds/<buildId>` 回應的 `validationResults`（`ado-run.sh` 會自動印出）。常見原因是 YAML 引用的 secure file 不存在或未授權；即使這次不會執行用到它的 stage 也一樣（踩坑 45）。
 - 結果是 `canceled` 而且時間接近 60 分鐘，多半是 job 逾時（踩坑 26），不是測試失敗。
 - 測試分頁的數字可能和 Gradle 輸出不同（踩坑 20，**原因未釐清**）。建置成敗以 Gradle 為準，數字差異如實回報，不要自行解釋原因。
 - 開了近期測試篩選時，確認實際執行的測試數大於 0。`ci-init.gradle` 只擋得住「清單為空」，擋不住「清單有內容但全部對不上」。
@@ -343,7 +349,7 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 
 | 檔案 | 內容 |
 |------|------|
-| `references/pitfalls.md` | 44 條踩坑：症狀、根因、解法、驗證狀態 |
+| `references/pitfalls.md` | 51 條踩坑：症狀、根因、解法、驗證狀態 |
 | `references/servers.example.yml` | 使用者層設定範例（server、權杖變數名、agent 路徑、已快取 Gradle 版本） |
 | `references/ci-tools.example.yml` | 專案層設定範例（repos 清單、pipeline 參數、基準分支） |
 | `references/ci-init.gradle` | Gradle CI init script |
