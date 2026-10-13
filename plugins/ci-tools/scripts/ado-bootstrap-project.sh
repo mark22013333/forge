@@ -502,10 +502,14 @@ for i in "${!N_NAME[@]}"; do
     load_pipes
     existing="$(pipe_for "${N_ID[$i]}")"
     via=""
-    if [ -z "$existing" ] && [ "$pcode" = 500 ]; then
+    # 只有「500 且回應是找不到檔案類訊息」才改走 build/definitions；其他 500（例：yaml 本身有錯）照原樣失敗，
+    # 避免建出一條壞定義
+    if [ -z "$existing" ] && [ "$pcode" = 500 ] \
+       && grep -qiE '找不到|not found|could not find|cannot find|does not exist' "$WORK/pipe-post-resp.json"; then
       # 踩坑 58：pipelines API 只到 repo 的預設分支找 yaml，yaml 只在別的分支時回 500「找不到檔案」。
       # 改用 build/definitions 並在 repository.defaultBranch 指定含 yaml 的分支，不必改 repo 的預設分支。
-      echo "    建立回 HTTP 500（pipelines API 只到 repo 預設分支找 yaml），改用 build/definitions 指定分支建立（踩坑 58）"
+      # 注意：body 沒帶 triggers，這樣建出的定義 yaml 的 CI trigger 是否生效未驗證（只實測過 trigger: none 的 CD）。
+      echo "    建立回 HTTP 500 且訊息為找不到檔案，可能是 yaml 不在 repo 預設分支（pipelines API 只到預設分支找），改用 build/definitions 指定分支建立（踩坑 58）"
       cp "$WORK/pipe-post-resp.json" "$RESP"
       head -c 300 "$RESP" | sed 's/^/    回應：/'; echo
       br="${want:+refs/heads/$want}"
@@ -532,6 +536,7 @@ for i in "${!N_NAME[@]}"; do
       200|201) echo "    已建立${via}並讀回：pipeline id ${existing}" ;;
       *) echo "    建立${via}回 HTTP ${pcode}，但重新列出已有 pipeline id ${existing}，視為成功（踩坑 34）" ;;
     esac
+    [ -n "$via" ] && warn "pipeline ${existing} 以 build/definitions 建立，yaml 的 CI 自動觸發是否生效未驗證：建完推一次 commit，用 statusFilter=inProgress,notStarted 查有沒有自動觸發（踩坑 56、58）"
     MAIN_PIPES="${MAIN_PIPES:+$MAIN_PIPES,}$existing"; N_PIPE[$i]="$existing"
   fi
 done

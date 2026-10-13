@@ -150,7 +150,7 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
    - 工具要裝成全機共用（python 用 `InstallAllUsers=1 PrependPath=1`），裝在個人帳號下的 NETWORK SERVICE 讀不到；有沒有裝好以探測 pipeline 的 `Get-Command` 為準，能力清單沒列不代表沒有（踩坑 57）。
    - 裝完要重啟 agent 服務才會讀到新的 PATH；**重啟會取消正在跑的建置**，先確認 agent 閒置（踩坑 54）。集區可能被同一個 collection 的其他專案共用，判斷 agent 在跑誰的建置要看 jobrequest 的 `scopeId`，不要看名稱或建置編號（踩坑 55）。
 5. 把 JDK 路徑、`GRADLE_USER_HOME`、npm 快取路徑記進 `servers.yml` 的 `agents`，之後每個專案共用。
-6. **agent 與 ADO 同一台**（踩坑 51）：`config.cmd` 的驗證類型用預設的 Integrated（目前登入的 Windows 帳號），不需要 PAT；裝在別台才需要 PAT。**Server 以 http 提供時 `--auth pat` 會失敗**（要求安全連線），用 `--auth integrated`；`--url` 照抄既有 agent 的 `.agent` 檔裡的 `serverUrl`，下載、解壓、`config.cmd` 的完整指令見踩坑 52。新 agent 第一次建置要連線跑（踩坑 38）。agent 會自動偵測已安裝的 JDK 並登記 `jdk_17_x64` 等能力（不看 `JAVA_HOME`），`demands` 可直接用。agent 以 NETWORK SERVICE 執行時，共用快取目錄要給它修改權限（`icacls <目錄> /grant "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M"`；此項為預防，**未驗證**）。
+6. **agent 與 ADO 同一台**（踩坑 51）：`config.cmd` 的驗證類型用預設的 Integrated（目前登入的 Windows 帳號），不需要 PAT；裝在別台才需要 PAT。**Server 以 http 提供時 `--auth pat` 會失敗**（要求安全連線），用 `--auth integrated`（已驗證的只有 agent 與 Server 同一台；「Server 用 http 且 agent 在別台」目前沒有驗證過的做法，見踩坑 52）；`--url` 照抄既有 agent 的 `.agent` 檔裡的 `serverUrl`，下載、解壓、`config.cmd` 的完整指令見踩坑 52。新 agent 第一次建置要連線跑（踩坑 38）。agent 會自動偵測已安裝的 JDK 並登記 `jdk_17_x64` 等能力（不看 `JAVA_HOME`），`demands` 可直接用。agent 以 NETWORK SERVICE 執行時，共用快取目錄要給它修改權限（`icacls <目錄> /grant "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M"`；此項為預防，**未驗證**）。
 
 ## 3. 建立 ADO 專案與匯入 repo（Gitea → ADO）
 
@@ -334,7 +334,7 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
    "${CLAUDE_PLUGIN_ROOT}/scripts/ado-bootstrap-project.sh" --config .ci-tools.yml
    ```
 
-4. **套用**：同一行加 `--apply`。每個寫入都會讀回比對，不一致就以結束碼 2 停下；任一步失敗即停。建 pipeline 時 pipelines API 回 500，會自動改用 build definitions 並指定 `branches` 的第一個分支（踩坑 58；這條路徑只有離線測試）。repo 還沒有內容時，預設分支與 pipeline 兩步會跳過，推送程式碼後**再跑一次**同一行就會補上（已存在的東西一律沿用，可以重複執行）。
+4. **套用**：同一行加 `--apply`。每個寫入都會讀回比對，不一致就以結束碼 2 停下；任一步失敗即停。建 pipeline 時 pipelines API 回 500 且回應含找不到檔案類訊息，會自動改用 build definitions 並指定 `branches` 的第一個分支（踩坑 58；這條路徑只有離線測試；這樣建出的定義 CI 自動觸發是否生效未驗證，建完推一次確認）。repo 還沒有內容時，預設分支與 pipeline 兩步會跳過，推送程式碼後**再跑一次**同一行就會補上（已存在的東西一律沿用，可以重複執行）。
 5. **推送程式碼**：預設不動程式碼，用 `sync-all-repos.sh --config .ci-tools.yml --apply`（第 6 章）。大型 repo 可改用 `--import`，由 ADO server 直接從 Git 平台拉（踩坑 46），需要環境變數 `GITEA_USER`、`GITEA_TOKEN`，來源要是 http(s) 網址（repo 的 `import_url`，省略時用 `gitea_url`）。腳本會建一個暫時的 Git 類 service endpoint，匯入結束（成功或失敗）就刪掉。**此路徑未驗證**：endpoint 型別名稱 `git` 不在官方 REST 文件的範例裡，腳本會先向 server 查詢這個型別是否存在。
 6. **上傳 secure file**（有 CD 時）：腳本不處理，只在結尾列出 yaml 引用的 secure file 名稱。第一次建置前先上傳到 **Library → Secure files**，再 `ado-authorize.sh grant --securefile <名稱> --pipelines <id>`，否則整條 pipeline 在驗證階段就失敗（踩坑 45）。
 7. **改 yaml 中與 agent 不一致的路徑**：腳本第 7 步讀本機的 `azure-pipelines.yml`（`.ci-tools.yml` 所在目錄的上一層＋repo 名稱），把 `JAVA_HOME`、`GRADLE_USER_HOME`、`NPM_CONFIG_CACHE` 和 servers.yml 該 server 的 agents 比對，不一致只警告、不改檔。
@@ -381,7 +381,7 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 4. **pipeline 兩個 stage**：Build 照舊，部署分支才發佈產物（**Build Artifacts**，Server 版不支援 Pipeline Artifacts，踩坑 37）；Deploy stage 只在部署分支執行，提供 dry-run 參數（建議預設開）。`DownloadBuildArtifacts` 的 `downloadPath` 用專用子目錄，否則 `cleanDestinationFolder` 會刪掉剛簽出的程式碼（踩坑 59）。
 5. **建立／移動部署分支會立刻觸發真部署**（踩坑 39）：先用 `ado-authorize.sh revoke --securefile <名稱> --pipelines <id>` 撤銷授權 → 移動分支 → 取消自動觸發的建置 → 恢復授權 → 手動以 dry-run 執行。
 6. **PowerShell 5.1**：`.ps1` 存 UTF-8 with BOM（踩坑 41）、開頭設 `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8`、包裝原生程式時暫改 `ErrorActionPreference`（踩坑 42）；推送前用 PowerShell 7 模擬 5.1 讀檔做解析檢查。
-7. **遠端預檢零落地**：預檢腳本以位元組經 ssh stdin 送進 `bash -s`，dry-run 不在 VM 寫任何東西；事後用 `find <專案根目錄> -newermt <時間>` 確認（排除服務自身持續寫入的檔案）。專案已有遠端部署腳本時不改它，改用包裝腳本（`setsid nohup`＋`sudo -n flock -n -E 75`，log 與結果檔放在原腳本會刪除的目錄之外）。見 `cd-ssh-vm.md`。
+7. **遠端預檢零落地**：預檢腳本以位元組經 ssh stdin 送進 `bash -s`，dry-run 不在 VM 寫任何東西；事後用 `find <專案根目錄> -newermt <時間>` 確認（排除服務自身持續寫入的檔案）。專案已有遠端部署腳本時不改它，改用包裝腳本（`setsid nohup`＋`sudo -n flock -n -E 75`，log 與結果檔放在原腳本會刪除的目錄之外；舊版 util-linux 的 flock 沒有 `-E`，預檢要先檢查）。見 `cd-ssh-vm.md`。
 8. **agent 上的 ssh／scp 不要設 `ConnectTimeout`**（踩坑 44）：Windows 版 OpenSSH 8.1 會每次等滿逾時才連上，分段上傳慢十倍以上而撞到 job 逾時。上傳慢時先用探測 pipeline 量 `ssh true` 的耗時，再對照 .NET 直接建 TCP 連線的時間。
 
 ---

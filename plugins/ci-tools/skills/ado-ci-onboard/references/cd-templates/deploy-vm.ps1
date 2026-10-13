@@ -5,10 +5,13 @@
 #
 # 本檔只負責 agent 端：預檢、（可選）產物比對、分段上傳＋sha256 驗證、上傳遠端腳本、在 VM 以 setsid nohup 背景執行並追蹤結果。
 # 遠端預檢把腳本以位元組經 ssh 的 stdin 送進 `bash -s -- precheck`，VM 上不落地任何檔案；-DryRun 在預檢後就結束，
-# 不在 VM 建目錄、不上傳（第五次導入的實際專案以同樣做法跑通 dry-run，事後在 VM 用 find -newermt 確認零寫入）。
+# 不在 VM 建目錄、不上傳。第五次導入的實際專案以同樣的 stdin 送入方式跑通 dry-run（事後在 VM 用 find -newermt 確認零寫入），
+# 但它送的是專用的唯讀預檢腳本；本檔送的是「常數＋整支遠端腳本」，兩者只共用送入方式。
 # VM 上的停止、備份、切換、健康檢查、回滾由專案的遠端腳本負責，契約見 cd-ssh-vm.md「遠端腳本契約」：
-#   bash -s -- precheck（腳本內容由 stdin 送入）  → 輸出 key=value（至少 locked、disk_avail_kb）；只能讀、不能寫，
-#                                                    且內部會讀 stdin 的子程序（sudo、docker、curl…）都要加 < /dev/null
+#   bash -s -- precheck（腳本內容由 stdin 送入）  → 輸出 key=value（至少 locked、disk_avail_kb），最後一行 precheck_done=1；
+#                                                    只能讀、不能寫；會讀 stdin 的子程序（sudo、docker、curl…）都要加 < /dev/null；
+#                                                    此時 $0 是 bash、沒有腳本檔路徑，precheck 路徑不得依賴 $0／BASH_SOURCE／腳本所在目錄
+#                                                    locked：0 未被持有、1 被持有、unreadable 讀不到；以 MISSING_／MISMATCH 開頭的行視為失敗
 #   bash <遠端腳本> deploy <產物> <sha256> <commit> → 結束前把 OK／ROLLED_BACK／ABORTED／MANUAL 寫進 $RESULT_FILE
 #
 # 需求：Windows PowerShell 5.1、Windows 內建 OpenSSH（C:\Windows\System32\OpenSSH\ssh.exe／scp.exe）。
@@ -123,7 +126,7 @@ function Write-LfFile([string]$path, [string]$text) {
     [System.IO.File]::WriteAllText($path, ($text -replace "`r`n", "`n"), $enc)
 }
 
-#---------------- 組遠端腳本（常數＋專案的遠端腳本）並上傳 ----------------
+#---------------- 組遠端腳本（常數＋專案的遠端腳本；上傳在 DryRun 判斷之後） ----------------
 if (-not (Test-Path $RemoteScript)) { Die "找不到遠端腳本 $RemoteScript" }
 $env2 = [ordered]@{ TS = $Ts; ACTOR = "ado-pipeline@$env:COMPUTERNAME"; RESULT_FILE = $ResultFile; STAGING = $RemoteStaging }
 foreach ($k in $RemoteEnv.Keys) { $env2[$k] = [string]$RemoteEnv[$k] }
@@ -146,14 +149,22 @@ Info ("產物 {0}（{1} MB、sha256 {2}…）" -f (Split-Path $Artifact -Leaf), 
 #---------------- 遠端預檢（唯讀，腳本經 stdin 送入，VM 上不落地） ----------------
 Info '遠端預檢（bash -s，VM 上不落地）'
 $Pre = @{}
+$PreBad = @()
 foreach ($line in (Invoke-SshStdin 'bash -s -- precheck' ([System.IO.File]::ReadAllBytes($CoreLocal)))) {
-    $s = [string]$line; $i = $s.IndexOf('=')
+    $s = [string]$line
+    if ($s -match '^(MISSING_|MISMATCH)') { $PreBad += $s; continue }
+    $i = $s.IndexOf('=')
     if ($i -gt 0) { $Pre[$s.Substring(0, $i)] = $s.Substring($i + 1) }
 }
-if ($SshExit -ne 0 -or $Pre.Count -eq 0) { Die "無法連線 $Target 或遠端預檢失敗（服務未變動）" }
-# 「讀不到鎖檔」與「鎖被持有」分開判斷（例：鎖檔被以 root 0600 建立時，一般帳號的預檢讀不到，見 cd-ssh-vm.md）
-if ($Pre['locked'] -eq 'unreadable') { Die '讀不到部署鎖檔（權限），無法判斷是否有部署在跑；請檢查鎖檔擁有者與權限' }
-if ($Pre['locked'] -eq '1') { Die '另一個部署正在進行中' }
+if ($SshExit -ne 0 -or $Pre['precheck_done'] -ne '1') { Die "無法連線 $Target 或遠端預檢沒有跑完（沒有 precheck_done=1，服務未變動）" }
+if ($PreBad.Count -gt 0) { $PreBad | ForEach-Object { Write-Host "  $_" }; Die '遠端環境與預期不符（服務未變動）' }
+# 鎖狀態 fail-closed：只有 0 視為未被持有；1（被持有）、unreadable（讀不到，例：鎖檔被以 root 0600 建立）與其他值一律中止
+switch ([string]$Pre['locked']) {
+    '0'          { }
+    '1'          { Die '另一個部署正在進行中' }
+    'unreadable' { Die '讀不到部署鎖檔（權限），無法判斷是否有部署在跑；請檢查鎖檔擁有者與權限' }
+    default      { Die "預檢回報的 locked 值無法辨識：「$($Pre['locked'])」（契約：0／1／unreadable）" }
+}
 $NeedKb = [int64]($Size * 3 / 1024)
 if ($Pre.ContainsKey('disk_avail_kb') -and [int64]$Pre['disk_avail_kb'] -lt $NeedKb) { Die "VM 磁碟可用 $($Pre['disk_avail_kb'])KB，不足產物×3（${NeedKb}KB）" }
 

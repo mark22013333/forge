@@ -108,13 +108,16 @@ dry-run 的承諾是「不動 VM」，所以預檢腳本也不要上傳到 VM：
 
 - agent 把預檢 bash 腳本讀成**位元組**（先轉 LF、去 BOM），以 `ProcessStartInfo` 寫進 ssh 的 stdin，遠端執行
   `bash -s -- <參數...>`。VM 上不落地任何檔案，也避開 PowerShell 5.1 管線依 `$OutputEncoding` 把中文轉成 `?` 的問題。
-  `deploy-vm.ps1` 的 `Invoke-SshStdin` 是這個寫法（第五次導入的實際專案以同樣做法跑通 dry-run）
+  `deploy-vm.ps1` 的 `Invoke-SshStdin` 是這個寫法。第五次導入的實際專案以同樣的 stdin 送入方式跑通 dry-run，但它送的是
+  **專用的唯讀預檢腳本**；範本送的是「常數＋整支遠端腳本」，兩者只共用送入方式
+- 經 `bash -s` 執行時 `$0` 是 `bash`、`BASH_SOURCE` 是空的，沒有腳本檔路徑：預檢路徑**不得依賴** `$0`、`$(dirname "$0")` 等腳本所在目錄
 - 腳本本身從 stdin 讀進來，所以腳本裡**任何會讀 stdin 的子程序**（`sudo`、`docker`、`curl`、`flock`…）都要加 `< /dev/null`，
   否則它們會吃掉後面還沒執行的腳本內容
 - 預檢只做讀取：`test`、`grep`、`df`、`sha256sum`、`sudo -n true`、`sudo -n -l <指令>`（只列權限）、`docker inspect` 等；
   鎖檔只在已存在時以唯讀開啟測一下共享鎖，不存在就不碰（不要因為預檢而建立鎖檔）
-- 預檢輸出一行一個 `KEY 值`（或 `key=value`），agent 端解析判定；約定以 `MISSING_`／`MISMATCH` 開頭的行一律視為失敗，
-  最後印一行完成標記（例：`PRECHECK_DONE`），沒看到就當作預檢沒跑完
+- 預檢輸出由 agent 端解析判定，格式以「遠端腳本契約」為準：一行一個 `key=value`、以 `MISSING_`／`MISMATCH` 開頭的行一律視為失敗、
+  最後印 `precheck_done=1`，沒看到就當作預檢沒跑完（`deploy-vm.ps1` 照這三條檢查）。參考專案自己的預檢用的是 `KEY 值` 格式與
+  `PRECHECK_DONE` 標記，屬該專案的慣例；換格式時 agent 端的解析要一起改
 - **驗證 dry-run 真的零寫入**：記下執行前的時間，跑完後在 VM 上 `find <專案根目錄> -newermt '<執行前時間>'`，應該沒有輸出；
   要排除服務本身持續寫入的檔案（實例：Quartz 內嵌資料庫 `quartz.mv.db`），不要把它當成 dry-run 寫的（第五次導入以此確認零寫入）
 
@@ -128,11 +131,12 @@ dry-run 的承諾是「不動 VM」，所以預檢腳本也不要上傳到 VM：
    原腳本成功時常會刪掉自己的 staging 目錄，放在裡面就連結果一起消失
 3. agent 以 `setsid nohup bash <包裝腳本> run ... < /dev/null >> <log> 2>&1 &` 在 VM 背景執行，ssh 立刻返回；agent 斷線不影響部署
 4. 包裝腳本內以 `sudo -n flock -n -E 75 <鎖檔> bash <TS>/deploy-remote.sh <參數>` 呼叫原腳本：
-   `-n` 拿不到鎖立即失敗、`-E 75` 讓「拿不到鎖」和原腳本自己的結束碼分得開；結束碼先寫暫存檔再改名成結果檔，agent 讀到時內容一定完整
+   `-n` 拿不到鎖立即失敗、`-E 75` 讓「拿不到鎖」和原腳本自己的結束碼分得開；結束碼先寫暫存檔再改名成結果檔，agent 讀到時內容一定完整。
+   舊版 util-linux 的 flock 沒有 `-E`（`--conflict-exit-code`），預檢要先檢查（例：`flock --help 2>&1 | grep -q -- --conflict-exit-code`，參考專案的預檢回報 `FLOCK_E yes/no`）
 5. agent 每隔一段時間以 `poll <已讀行數>` 取回結果檔狀態與新增的 log 行，印到 ADO log；逾時只代表 ADO 不再等，VM 上的部署仍繼續
 6. **umask**：包裝腳本若為了保護 log 設了 `umask 077`，呼叫 `sudo flock` 前要改回 `umask 022`。〔推測〕umask 可能經 sudo 傳給 flock，
-   鎖檔第一次被以 root `0600` 建立，之後一般帳號跑的預檢讀不到它；預檢因此要把「讀不到」（`unreadable`）和「被持有」（`busy`）分開回報，
-   不要把讀不到誤判成有部署在跑。是否真的會發生取決於 sudo 是否經 pam_umask 套用自己的 umask，容器實驗未重現
+   鎖檔第一次被以 root `0600` 建立，之後一般帳號跑的預檢讀不到它；預檢因此要把「讀不到」和「被持有」分開回報
+   （範本契約的值是 `locked=unreadable` 與 `locked=1`，兩者都會讓 `deploy-vm.ps1` 中止正式部署），不要把讀不到誤判成有部署在跑。是否真的會發生取決於 sudo 是否經 pam_umask 套用自己的 umask，容器實驗未重現
 7. 同一台 VM 若還有其他部署途徑（例：開發者本機直接跑部署腳本）沒有取同一把鎖，兩條路徑之間**不互斥**，要在文件裡寫明
 
 驗證狀態：第五次導入的實作只在 ADO 上跑過 dry-run（預檢經 stdin、零寫入已確認）；包裝腳本的正式部署路徑只在 Linux 容器內以假的
@@ -160,9 +164,12 @@ agent 的 PowerShell task 預設用 Windows PowerShell 5.1：
 
 `deploy-vm.ps1` 只負責傳輸與追蹤，VM 上的實際動作由專案自己的遠端腳本（bash）負責。契約：
 
-- 呼叫方式：`bash <遠端腳本> deploy <staged 產物路徑> <sha256> <commit>`；另需支援唯讀的 `precheck`（輸出 `key=value`，至少 `locked`、`disk_avail_kb`）
-- `precheck` 由 agent 以 `bash -s -- precheck` 執行、腳本內容從 stdin 送入（VM 不落地），所以 precheck 路徑裡會讀 stdin 的子程序都要加 `< /dev/null`；
-  `locked` 的值：`0` 未被持有、`1` 被持有、`unreadable` 鎖檔存在但讀不到（`deploy-vm.ps1` 對後兩者分別以不同訊息中止）
+- 呼叫方式：`bash <遠端腳本> deploy <staged 產物路徑> <sha256> <commit>`；另需支援唯讀的 `precheck`
+- `precheck` 的輸出：一行一個 `key=value`，至少 `locked`、`disk_avail_kb`，**最後一行** `precheck_done=1`；環境不符時印以 `MISSING_` 或 `MISMATCH` 開頭的行。
+  `deploy-vm.ps1` 沒看到 `precheck_done=1`、或看到任何 `MISSING_`／`MISMATCH` 行，就中止
+- `locked` 的值：`0` 未被持有、`1` 被持有、`unreadable` 鎖檔存在但讀不到。只有 `0` 會繼續；`1`、`unreadable` 與其他任何值都中止（fail-closed）
+- `precheck` 由 agent 以 `bash -s -- precheck` 執行、腳本內容從 stdin 送入（VM 不落地）：precheck 路徑裡會讀 stdin 的子程序都要加 `< /dev/null`，
+  且**不得依賴** `$0`／`BASH_SOURCE`／腳本所在目錄（此時 `$0` 是 `bash`；`deploy` 仍以檔案執行，兩種模式的 `$0` 不同）
 - 由 agent 以 `setsid nohup` 背景啟動，stdout／stderr 寫到 run log；**agent 斷線不影響遠端繼續執行**
 - 結束前把一個字寫進環境變數 `RESULT_FILE` 指定的檔案：
 

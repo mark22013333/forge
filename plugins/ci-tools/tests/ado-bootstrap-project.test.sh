@@ -301,6 +301,7 @@ check "build/definitions 用 api-version 6.0" 'grep -q "^POST	[^	]*/proj-x/_apis
 check "沒有改 repo 的預設分支" '! grep -q "^PATCH	[^	]*/git/repositories/" "$FAKE_LOG"'
 check "pipelines 與 build/definitions 各只 POST 一次" '[ "$(grep -c "^POST	.*/_apis/pipelines?" "$FAKE_LOG")" -eq 1 ] && [ "$(grep -c "^POST	.*/build/definitions?" "$FAKE_LOG")" -eq 1 ]'
 check "授權用新的 pipeline id 8" 'grep "^PATCH	.*/pipelinePermissions/queue/9" "$FAKE_LOG" | cut -f3 | grep -q "\"id\": 8"'
+check "訊息用「可能是」，並警告 CI 自動觸發未驗證" 'echo "$OUT" | grep -q "可能是 yaml 不在 repo 預設分支" && echo "$OUT" | grep -q "警告：pipeline 8 以 build/definitions 建立，yaml 的 CI 自動觸發是否生效未驗證"'
 
 scenario "情境 4d：500 後改用 build/definitions 回 200，但重新列出仍沒有 → exit 2" \
   "${R_OKREPOS[@]}" \
@@ -320,6 +321,16 @@ scenario "情境 4e：500 後佇列不存在 → exit 2，不發 build/definitio
   $'GET\t/distributedtask/queues?queueName=Default\t200\tpipes-none.json'
 OUT="$(bash "$BOOT" --apply "${args[@]}" 2>&1)"; RC=$?
 check "exit 2、說明找不到佇列、沒有 POST build/definitions" '[ $RC -eq 2 ] && echo "$OUT" | grep -q "找不到 agent 佇列「Default」" && ! grep -q "build/definitions" "$FAKE_LOG"'
+
+r err-500-other.json '{"message":"TF400898: An Internal Error Occurred."}'
+scenario "情境 4f：500 但不是找不到檔案 → 不走 fallback，照原樣失敗" \
+  "${R_OKREPOS[@]}" \
+  $'GET\t/git/repositories/rid-main/items?\t200\titems.json' \
+  $'GET\t/_apis/pipelines?\t200\tpipes-none.json' \
+  $'POST\t/_apis/pipelines?\t500\terr-500-other.json' \
+  "$R_Q"
+OUT="$(bash "$BOOT" --apply "${args[@]}" 2>&1)"; RC=$?
+check "exit 1、印出 HTTP 500 與原回應、沒有查佇列也沒有 POST build/definitions" '[ $RC -eq 1 ] && echo "$OUT" | grep -q "建立 pipeline（app-main CI），重新列出也沒有 失敗（HTTP 500）" && echo "$OUT" | grep -q "TF400898" && ! grep -q "build/definitions\|distributedtask/queues" "$FAKE_LOG"'
 
 scenario "情境 4b：建立 pipeline 回 200，但重新列出沒有 → exit 2" \
   "${R_OKREPOS[@]}" \

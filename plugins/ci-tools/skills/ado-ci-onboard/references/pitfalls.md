@@ -372,8 +372,9 @@
 - **解法**：改用 build definitions API，在 `repository.defaultBranch` 指定含 yaml 的分支，**不必改 repo 的預設分支**：
   `POST {collection}/<專案>/_apis/build/definitions?api-version=6.0`，body
   `{"name":"<名稱>","type":"build","queue":{"id":<佇列 id>},"process":{"type":2,"yamlFilename":"/<yaml 路徑>"},"repository":{"id":"<repo id>","name":"<repo 名稱>","type":"TfsGit","defaultBranch":"refs/heads/<含 yaml 的分支>"}}`。
-  佇列 id 用 `GET .../_apis/distributedtask/queues?queueName=Default` 取得。另一個可行但會動到 repo 設定的做法：暫時把 repo 預設分支改成含 yaml 的分支 → 建立 → 改回（另一次操作實際用過）。`scripts/ado-bootstrap-project.sh` 在 pipelines API 回 500 時自動改走 build definitions（腳本的這條路徑只有離線測試）。
-- **驗證狀態**：已遇到（500 → 改用 build definitions 一次成功）
+  佇列 id 用 `GET .../_apis/distributedtask/queues?queueName=Default` 取得。另一個可行但會動到 repo 設定的做法：暫時把 repo 預設分支改成含 yaml 的分支 → 建立 → 改回（另一次操作實際用過）。`scripts/ado-bootstrap-project.sh` 在 pipelines API 回 500、且回應含找不到檔案類訊息時，自動改走 build definitions（腳本的這條路徑只有離線測試）。
+- **驗證狀態**：已遇到（500 → 改用 build definitions 一次成功）。**只證明「建得起來」**：實際建的是 `trigger: none` 的 CD pipeline；body 沒帶 `triggers`，
+  用這個方式建出的定義，yaml 裡的 CI trigger（推送自動觸發）是否生效**未驗證**。建 CI pipeline 時，建完推一次 commit，照第 56 條查有沒有自動觸發
 
 ### 29. 透過 SSH 推送後，CI 觸發有明顯延遲
 
