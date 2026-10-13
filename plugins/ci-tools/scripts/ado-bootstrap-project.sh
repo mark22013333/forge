@@ -13,7 +13,8 @@
 #   2. repo：依 repos 清單；專案自帶的同名空 repo 改名給第一個 role: main 的 repo，其餘新建（踩坑 27、46）
 #   3. 程式碼：預設不動，提示用 sync-all-repos.sh 推送；--import 時對空 repo 用 server 端匯入（未驗證）
 #   4. 預設分支：改成 branches 的第一個（用 repo id，踩坑 18、27）
-#   5. pipeline：main repo 有 /azure-pipelines.yml 且還沒有對應的 pipeline 就建立；建完重新列出確認（踩坑 34、36）
+#   5. pipeline：main repo 有 /azure-pipelines.yml 且還沒有對應的 pipeline 就建立；建完重新列出確認（踩坑 34、36）。
+#      pipelines API 回 500（yaml 不在 repo 預設分支）時，改用 build/definitions 指定分支建立（踩坑 58）
 #   6. 授權：呼叫 ado-authorize.sh 授權 agent 佇列與依賴 repo（踩坑 35）；secure file 只提示，不自動處理（踩坑 45）
 #   7. 環境一致性（只讀）：本機 azure-pipelines.yml 的 JAVA_HOME／GRADLE_USER_HOME／NPM_CONFIG_CACHE
 #      與 servers.yml 的 agent 路徑比對；yaml 與 bin/*.sh 裡出現其他 server 的主機名就列出
@@ -500,15 +501,36 @@ for i in "${!N_NAME[@]}"; do
     cp "$RESP" "$WORK/pipe-post-resp.json"
     load_pipes
     existing="$(pipe_for "${N_ID[$i]}")"
+    via=""
+    if [ -z "$existing" ] && [ "$pcode" = 500 ]; then
+      # 踩坑 58：pipelines API 只到 repo 的預設分支找 yaml，yaml 只在別的分支時回 500「找不到檔案」。
+      # 改用 build/definitions 並在 repository.defaultBranch 指定含 yaml 的分支，不必改 repo 的預設分支。
+      echo "    建立回 HTTP 500（pipelines API 只到 repo 預設分支找 yaml），改用 build/definitions 指定分支建立（踩坑 58）"
+      cp "$WORK/pipe-post-resp.json" "$RESP"
+      head -c 300 "$RESP" | sed 's/^/    回應：/'; echo
+      br="${want:+refs/heads/$want}"
+      [ -n "$br" ] || br="$(repo_field "$name" defaultBranch)"
+      [ -n "$br" ] || mismatch "不知道 ${name} 的 yaml 在哪個分支（.ci-tools.yml 的 branches 是空的，repo 也沒有預設分支）"
+      code="$(req GET "$BASE/distributedtask/queues?queueName=$(urlenc "$QUEUE")&api-version=$api")"
+      [ "$code" = 200 ] || http_fail "$code" "查詢 agent 佇列「${QUEUE}」"
+      qid="$(pyjson "v=[q for q in d.get('value',[]) if (q.get('name') or '').lower()==sys.argv[2].lower()]; print(v[0]['id'] if v else '')" "$QUEUE")"
+      [ -n "$qid" ] || mismatch "專案裡找不到 agent 佇列「${QUEUE}」（.ci-tools.yml 的 agent_queue）"
+      mkbody "$WORK/def.json" '{"name": a[0] + " CI", "type": "build", "queue": {"id": int(a[2])}, "process": {"type": 2, "yamlFilename": "/azure-pipelines.yml"}, "repository": {"id": a[1], "name": a[0], "type": "TfsGit", "defaultBranch": a[3]}}' "$name" "${N_ID[$i]}" "$qid" "$br"
+      pcode="$(req POST "$BASE/build/definitions?api-version=$api" "$WORK/def.json")"
+      cp "$RESP" "$WORK/pipe-post-resp.json"
+      load_pipes
+      existing="$(pipe_for "${N_ID[$i]}")"
+      via="（build/definitions，分支 ${br}）"
+    fi
     if [ -z "$existing" ]; then
       case "$pcode" in
-        200|201) mismatch "建立 pipeline 回 HTTP ${pcode}，但重新列出時找不到指向 ${name} /azure-pipelines.yml 的 pipeline" ;;
-        *) cp "$WORK/pipe-post-resp.json" "$RESP"; http_fail "$pcode" "建立 pipeline（${name} CI），重新列出也沒有" ;;
+        200|201) mismatch "建立 pipeline${via}回 HTTP ${pcode}，但重新列出時找不到指向 ${name} /azure-pipelines.yml 的 pipeline" ;;
+        *) cp "$WORK/pipe-post-resp.json" "$RESP"; http_fail "$pcode" "建立 pipeline（${name} CI）${via}，重新列出也沒有" ;;
       esac
     fi
     case "$pcode" in
-      200|201) echo "    已建立並讀回：pipeline id ${existing}" ;;
-      *) echo "    建立回 HTTP ${pcode}，但重新列出已有 pipeline id ${existing}，視為成功（踩坑 34）" ;;
+      200|201) echo "    已建立${via}並讀回：pipeline id ${existing}" ;;
+      *) echo "    建立${via}回 HTTP ${pcode}，但重新列出已有 pipeline id ${existing}，視為成功（踩坑 34）" ;;
     esac
     MAIN_PIPES="${MAIN_PIPES:+$MAIN_PIPES,}$existing"; N_PIPE[$i]="$existing"
   fi

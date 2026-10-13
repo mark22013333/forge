@@ -279,6 +279,47 @@ check "POST body：名稱、folder、yaml、azureReposGit" 'body_of POST "/_apis
 check "POST 後重新列出 pipeline" '[ "$(grep -c "^GET	.*/_apis/pipelines?" "$FAKE_LOG")" -eq 2 ]'
 check "只 POST 一次（不重送）" '[ "$(grep -c "^POST	.*/_apis/pipelines?" "$FAKE_LOG")" -eq 1 ]'
 check "授權用新的 pipeline id 8" 'grep "^PATCH	.*/pipelinePermissions/queue/9" "$FAKE_LOG" | cut -f3 | grep -q "\"id\": 8"'
+check "401 不改走 build/definitions" '! grep -q "build/definitions" "$FAKE_LOG"'
+
+# ---------------------------------------------------------------- 情境 4c～4e：pipelines API 回 500 → 改用 build/definitions（踩坑 58）
+r err-500.json '{"message":"找不到檔案 /azure-pipelines.yml"}'
+r def-8.json '{"id":8,"name":"app-main CI"}'
+scenario "情境 4c：建立 pipeline 回 500 → 改用 build/definitions 指定分支，重新列出有 → 成功" \
+  "${R_OKREPOS[@]}" \
+  $'GET\t/git/repositories/rid-main/items?\t200\titems.json' \
+  $'GET\t/_apis/pipelines?\t200\tpipes-none.json,pipes-none.json,pipes-8.json' \
+  $'GET\t/_apis/pipelines/8?\t200\tpipe-8.json' \
+  $'POST\t/_apis/pipelines?\t500\terr-500.json' \
+  $'POST\t/_apis/build/definitions?\t200\tdef-8.json' \
+  "$R_Q" "$R_CORE" "$R_PERM_PATCH" \
+  $'GET\t/pipelinePermissions/\t200\tperm-none.json,perm-8.json,perm-none.json,perm-8.json'
+OUT="$(bash "$BOOT" --apply "${args[@]}" 2>&1)"; RC=$?
+echo "$OUT" | sed -n '/== 5/,/^$/p' | sed 's/^/    | /'
+check "exit 0 並說明改用 build/definitions" '[ $RC -eq 0 ] && echo "$OUT" | grep -q "改用 build/definitions 指定分支建立（踩坑 58）" && echo "$OUT" | grep -q "已建立（build/definitions，分支 refs/heads/main）並讀回：pipeline id 8"'
+check "build/definitions body：佇列 id、yamlFilename、TfsGit、defaultBranch 為 branches 第一個" 'body_of POST "/_apis/build/definitions?" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d=={\"name\":\"app-main CI\",\"type\":\"build\",\"queue\":{\"id\":9},\"process\":{\"type\":2,\"yamlFilename\":\"/azure-pipelines.yml\"},\"repository\":{\"id\":\"rid-main\",\"name\":\"app-main\",\"type\":\"TfsGit\",\"defaultBranch\":\"refs/heads/main\"}}"'
+check "build/definitions 用 api-version 6.0" 'grep -q "^POST	[^	]*/proj-x/_apis/build/definitions?api-version=6.0	" "$FAKE_LOG"'
+check "沒有改 repo 的預設分支" '! grep -q "^PATCH	[^	]*/git/repositories/" "$FAKE_LOG"'
+check "pipelines 與 build/definitions 各只 POST 一次" '[ "$(grep -c "^POST	.*/_apis/pipelines?" "$FAKE_LOG")" -eq 1 ] && [ "$(grep -c "^POST	.*/build/definitions?" "$FAKE_LOG")" -eq 1 ]'
+check "授權用新的 pipeline id 8" 'grep "^PATCH	.*/pipelinePermissions/queue/9" "$FAKE_LOG" | cut -f3 | grep -q "\"id\": 8"'
+
+scenario "情境 4d：500 後改用 build/definitions 回 200，但重新列出仍沒有 → exit 2" \
+  "${R_OKREPOS[@]}" \
+  $'GET\t/git/repositories/rid-main/items?\t200\titems.json' \
+  $'GET\t/_apis/pipelines?\t200\tpipes-none.json' \
+  $'POST\t/_apis/pipelines?\t500\terr-500.json' \
+  $'POST\t/_apis/build/definitions?\t200\tdef-8.json' \
+  "$R_Q"
+OUT="$(bash "$BOOT" --apply "${args[@]}" 2>&1)"; RC=$?
+check "exit 2 並說明是 build/definitions 建的" '[ $RC -eq 2 ] && echo "$OUT" | grep -q "建立 pipeline（build/definitions，分支 refs/heads/main）回 HTTP 200，但重新列出時找不到"'
+
+scenario "情境 4e：500 後佇列不存在 → exit 2，不發 build/definitions" \
+  "${R_OKREPOS[@]}" \
+  $'GET\t/git/repositories/rid-main/items?\t200\titems.json' \
+  $'GET\t/_apis/pipelines?\t200\tpipes-none.json' \
+  $'POST\t/_apis/pipelines?\t500\terr-500.json' \
+  $'GET\t/distributedtask/queues?queueName=Default\t200\tpipes-none.json'
+OUT="$(bash "$BOOT" --apply "${args[@]}" 2>&1)"; RC=$?
+check "exit 2、說明找不到佇列、沒有 POST build/definitions" '[ $RC -eq 2 ] && echo "$OUT" | grep -q "找不到 agent 佇列「Default」" && ! grep -q "build/definitions" "$FAKE_LOG"'
 
 scenario "情境 4b：建立 pipeline 回 200，但重新列出沒有 → exit 2" \
   "${R_OKREPOS[@]}" \
