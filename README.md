@@ -51,7 +51,7 @@ claude plugin install git-tools
 
 ### ci-tools — 自架 Azure DevOps Server 導入 CI
 
-引導把自架 Azure DevOps Server 接上既有 Gitea 專案的 CI，附探索腳本、兩層設定檔範例、pipeline 範本、Gradle init script、首次建置失敗分類腳本、Gitea → ADO 同步腳本（含多 repo）與四次實際導入整理的踩坑表。
+引導把自架 Azure DevOps Server 接上既有 Gitea 專案的 CI，附探索腳本、兩層設定檔範例、pipeline 範本、Gradle init script、首次建置失敗分類腳本、Gitea → ADO 同步腳本（含多 repo）與五次實際導入整理的踩坑表。
 
 | Skill | 說明 | 觸發方式 |
 |-------|------|---------|
@@ -61,13 +61,13 @@ claude plugin install git-tools
 
 - 第 0 步先探索：`ci-discover.sh` 唯讀掃描既有的 servers.yml、其他專案的 pipeline、`~/.ssh` 金鑰型別、git 平台（看 API 不看主機名）、ADO 上的專案與 agent pools，再建議要不要安裝
 - 兩層設定：使用者層 `servers.yml`（server、權杖環境變數名、agent 路徑、已快取的 Gradle 版本）＋專案層 `.ci-tools.yml`（repos 清單、pipeline 參數、產品基準分支）；兩者都放在使用者端，專案專屬值不寫進本 plugin；不需要 PyYAML／yq
-- 51 條踩坑（症狀／根因／解法／驗證狀態），估計值與未釐清的項目照實標示
+- 59 條踩坑（症狀／根因／解法／驗證狀態），估計值與未釐清的項目照實標示
 - `ci-init.gradle`：不改 build.gradle，關閉 failFast、每個測試類別獨立 JVM、只跑近期修改的測試（清單為空即失敗）
 - Pipeline 範本：全部改為 `jobs:`＋`timeoutInMinutes`（預設 120）。Gradle＋JDK17 可指定 Gradle task 與多個依賴 repo（結構已在真實專案跑綠；去識別化參數化版未重新執行），Maven JDK8／JDK25、Vue、Python（未驗證）
 - `ci-triage.sh`：從建置 log 抽出失敗的測試類別，產生本機重跑與產品基準比對指令（對 ADO 只發 GET）
 - `sync-gitea-to-ado.sh`：預設只預覽，`--apply` 才推；只快轉、分叉就停、保護分支只印指令
 - `sync-all-repos.sh`：依 `.ci-tools.yml` 同步所有 repo，依賴 repo 先推，任一 repo 分叉就全部不推
-- `ado-bootstrap-project.sh`：接上新 server／換 server 時，依 `.ci-tools.yml` 一次備好 ADO 專案、repo（預設 repo 改名）、預設分支、pipeline 與授權，並比對 yaml 與 agent 的路徑；預設只預覽，`--apply` 才寫入且每步讀回確認（僅離線測試，未在真實 server 驗證；`--import` 走 server 端匯入，同樣未驗證）
+- `ado-bootstrap-project.sh`：接上新 server／換 server 時，依 `.ci-tools.yml` 一次備好 ADO 專案、repo（預設 repo 改名）、預設分支、pipeline 與授權，並比對 yaml 與 agent 的路徑；pipelines API 因 yaml 不在預設分支回 500 時改用 build definitions 指定分支建立；預設只預覽，`--apply` 才寫入且每步讀回確認（僅離線測試，未在真實 server 驗證；`--import` 走 server 端匯入，同樣未驗證）
 
 **同步腳本參數（單一 repo）**
 

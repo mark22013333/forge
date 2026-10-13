@@ -1,0 +1,62 @@
+# 臨時探測 pipeline（第二階段）：用 CD 部署金鑰實際登入 VM，確認金鑰、主機金鑰釘選與專案目錄權限（cd-ssh-vm.md 第 3 步之後）
+#
+# 驗證狀態：同結構的探測已在第五次導入的實際專案跑通（echo ok、whoami、ls -ld 皆有輸出）；本檔為去識別化改寫版，改寫後未在 ADO 重跑。
+#           遠端指令中的 `sudo -n true` 檢查是本檔新增的（cd-ssh-vm.md 第 2 步），實際專案跑過的探測不含這一項。
+#
+# 和 probe-agent-ssh.yml 的差別：那支不帶金鑰、只看 TCP 與握手；這支要先完成
+#   1. VM 的 authorized_keys 已加入部署公鑰（cd-ssh-vm.md 第 2 步）
+#   2. 主機金鑰釘選檔已放進 repo（例：ci/<環境>_known_hosts）
+#   3. 私鑰已上傳為 secure file，且 pipeline 已被授權使用（否則整條 pipeline 在驗證階段就失敗，踩坑 45）
+# 所以另外寫成一支，而不是加在 probe-agent-ssh.yml 裡：yaml 一引用 secure file，就算該步驟不執行也會被檢查。
+#
+# 用法：放在要部署的 repo 的某個分支（或臨時 repo），建 pipeline、授權佇列與 secure file、手動執行；看完輸出後刪除 pipeline。
+# 遠端只執行唯讀指令，不在 VM 寫入任何東西。
+
+trigger: none
+pr: none
+
+pool:
+  name: Default        # 依 servers.yml 的 agent pool 調整
+
+variables:
+  VM_HOST: '<VM 位址>'
+  VM_PORT: '22'
+  VM_USER: '<VM 帳號>'
+  PROJECT_ROOT: '<VM 上的專案根目錄>'
+  KNOWN_HOSTS: 'ci/<環境>_known_hosts'   # repo 內的路徑
+
+jobs:
+  - job: probe_key
+    timeoutInMinutes: 10
+    steps:
+      - checkout: self
+        fetchDepth: 1
+
+      - task: DownloadSecureFile@1
+        name: deployKey
+        displayName: '取得部署金鑰'
+        inputs:
+          secureFile: '<secure file 名稱>'
+
+      - powershell: |
+          $ErrorActionPreference = 'Stop'
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $ssh = Join-Path $env:WINDIR 'System32\OpenSSH\ssh.exe'
+          $kh  = Join-Path '$(Build.SourcesDirectory)' '$(KNOWN_HOSTS)'
+          if (-not (Test-Path $kh)) { Write-Host "##vso[task.logissue type=error]找不到主機金鑰檔 $kh"; exit 1 }
+          # 私鑰複製到 Agent.TempDirectory 並收緊權限：Windows OpenSSH 拒絕其他帳號可讀的私鑰
+          $key = Join-Path '$(Agent.TempDirectory)' 'probe_deploy_key'
+          Copy-Item '$(deployKey.secureFilePath)' $key -Force
+          & icacls $key /inheritance:r /grant:r "$(whoami):R" | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Host '##vso[task.logissue type=error]無法設定私鑰檔權限'; exit 1 }
+          # StrictHostKeyChecking=yes＋釘選檔：主機金鑰不符就拒絕連線；不設 ConnectTimeout（踩坑 44）
+          $ErrorActionPreference = 'Continue'
+          $out = & $ssh -i $key -p $(VM_PORT) -o BatchMode=yes -o IdentitiesOnly=yes `
+                   -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$kh" -o LogLevel=ERROR `
+                   '$(VM_USER)@$(VM_HOST)' 'echo ok; whoami; ls -ld $(PROJECT_ROOT); sudo -n true && echo sudo=nopasswd || echo sudo=password' 2>&1
+          $rc = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host "  $_" }
+          Remove-Item $key -Force -ErrorAction SilentlyContinue
+          if ($rc -ne 0) { Write-Host "##vso[task.logissue type=error]ssh 結束碼 $rc"; exit 1 }
+          exit 0
+        displayName: '以部署金鑰登入 VM（唯讀）'

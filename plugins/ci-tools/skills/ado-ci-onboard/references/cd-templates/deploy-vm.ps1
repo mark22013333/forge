@@ -4,8 +4,14 @@
 #           但本骨架（改寫後）沒有在 ADO 執行過。第一次套用請先以 -DryRun 跑，並照 SKILL.md 第 5 章用 REST API 看 log。
 #
 # 本檔只負責 agent 端：預檢、（可選）產物比對、分段上傳＋sha256 驗證、上傳遠端腳本、在 VM 以 setsid nohup 背景執行並追蹤結果。
+# 遠端預檢把腳本以位元組經 ssh 的 stdin 送進 `bash -s -- precheck`，VM 上不落地任何檔案；-DryRun 在預檢後就結束，
+# 不在 VM 建目錄、不上傳。第五次導入的實際專案以同樣的 stdin 送入方式跑通 dry-run（事後在 VM 用 find -newermt 確認零寫入），
+# 但它送的是專用的唯讀預檢腳本；本檔送的是「常數＋整支遠端腳本」，兩者只共用送入方式。
 # VM 上的停止、備份、切換、健康檢查、回滾由專案的遠端腳本負責，契約見 cd-ssh-vm.md「遠端腳本契約」：
-#   bash <遠端腳本> precheck                      → 輸出 key=value（至少 locked、disk_avail_kb）
+#   bash -s -- precheck（腳本內容由 stdin 送入）  → 輸出 key=value（至少 locked、disk_avail_kb），最後一行 precheck_done=1；
+#                                                    只能讀、不能寫；會讀 stdin 的子程序（sudo、docker、curl…）都要加 < /dev/null；
+#                                                    此時 $0 是 bash、沒有腳本檔路徑，precheck 路徑不得依賴 $0／BASH_SOURCE／腳本所在目錄
+#                                                    locked：0 未被持有、1 被持有、unreadable 讀不到；以 MISSING_／MISMATCH 開頭的行視為失敗
 #   bash <遠端腳本> deploy <產物> <sha256> <commit> → 結束前把 OK／ROLLED_BACK／ABORTED／MANUAL 寫進 $RESULT_FILE
 #
 # 需求：Windows PowerShell 5.1、Windows 內建 OpenSSH（C:\Windows\System32\OpenSSH\ssh.exe／scp.exe）。
@@ -67,6 +73,48 @@ function Invoke-Ssh([string]$cmd) {
     $script:SshExit = $LASTEXITCODE
     return $out
 }
+# Windows 命令列參數引號（MSVC CRT 規則），給 ProcessStartInfo.Arguments 用
+function ConvertTo-WinArg([string]$a) {
+    if ($a.Length -eq 0) { return '""' }
+    if ($a -notmatch '[\s"]') { return $a }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    $bs = 0
+    foreach ($c in $a.ToCharArray()) {
+        if ($c -eq [char]'\') { $bs++; continue }
+        if ($c -eq [char]'"') { [void]$sb.Append('\' * (2 * $bs + 1)); [void]$sb.Append('"'); $bs = 0; continue }
+        if ($bs -gt 0) { [void]$sb.Append('\' * $bs); $bs = 0 }
+        [void]$sb.Append($c)
+    }
+    [void]$sb.Append('\' * (2 * $bs))
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+# 把位元組直接寫進 ssh 的 stdin（例：bash -s 執行的腳本）。不用 PowerShell 管線：5.1 會依 $OutputEncoding 把中文轉成 ?
+function Invoke-SshStdin([string]$cmd, [byte[]]$bytes) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Ssh
+    $psi.Arguments = ((@($SshOnlyOpts) + @($Target, $cmd) | ForEach-Object { ConvertTo-WinArg $_ }) -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    $psi.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
+    $p = [System.Diagnostics.Process]::Start($psi)
+    try {
+        $tOut = $p.StandardOutput.ReadToEndAsync()
+        $tErr = $p.StandardError.ReadToEndAsync()
+        $p.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+        $p.StandardInput.BaseStream.Flush()
+        $p.StandardInput.Close()
+        $p.WaitForExit()
+        $script:SshExit = $p.ExitCode
+        $err = $tErr.Result.Trim()
+        if ($err) { $err -split "`n" | ForEach-Object { Write-Host "  (stderr) $_" } }
+        return ($tOut.Result -split "`n" | ForEach-Object { $_.TrimEnd("`r") })
+    } finally { $p.Dispose() }
+}
 function Send-File([string]$local, [string]$remote) {
     $ErrorActionPreference = 'Continue'
     & $Scp @SshOpts -q $local "${Target}:$remote" 2>&1 | Out-Host
@@ -78,7 +126,7 @@ function Write-LfFile([string]$path, [string]$text) {
     [System.IO.File]::WriteAllText($path, ($text -replace "`r`n", "`n"), $enc)
 }
 
-#---------------- 組遠端腳本（常數＋專案的遠端腳本）並上傳 ----------------
+#---------------- 組遠端腳本（常數＋專案的遠端腳本；上傳在 DryRun 判斷之後） ----------------
 if (-not (Test-Path $RemoteScript)) { Die "找不到遠端腳本 $RemoteScript" }
 $env2 = [ordered]@{ TS = $Ts; ACTOR = "ado-pipeline@$env:COMPUTERNAME"; RESULT_FILE = $ResultFile; STAGING = $RemoteStaging }
 foreach ($k in $RemoteEnv.Keys) { $env2[$k] = [string]$RemoteEnv[$k] }
@@ -91,9 +139,6 @@ foreach ($k in $env2.Keys) {
 $CoreLocal = Join-Path $Work 'remote.sh'
 Write-LfFile $CoreLocal ($hdr + [System.IO.File]::ReadAllText($RemoteScript, [System.Text.Encoding]::UTF8))
 $CoreRemote = "$Prefix.remote.sh"
-Invoke-Ssh "mkdir -p $RemoteStaging" | Out-Null
-if ($SshExit -ne 0) { Die "無法連線 $Target（服務未變動）" }
-Send-File $CoreLocal $CoreRemote
 
 #---------------- 本機端預檢 ----------------
 if (-not (Test-Path $Artifact)) { Die "產物不存在：$Artifact" }
@@ -101,15 +146,25 @@ $Size = (Get-Item $Artifact).Length
 $Sha = (Get-FileHash -Algorithm SHA256 $Artifact).Hash.ToLower()
 Info ("產物 {0}（{1} MB、sha256 {2}…）" -f (Split-Path $Artifact -Leaf), [math]::Round($Size / 1MB), $Sha.Substring(0, 16))
 
-#---------------- 遠端預檢（唯讀） ----------------
-Info '遠端預檢'
+#---------------- 遠端預檢（唯讀，腳本經 stdin 送入，VM 上不落地） ----------------
+Info '遠端預檢（bash -s，VM 上不落地）'
 $Pre = @{}
-foreach ($line in (Invoke-Ssh "bash $CoreRemote precheck")) {
-    $s = [string]$line; $i = $s.IndexOf('=')
+$PreBad = @()
+foreach ($line in (Invoke-SshStdin 'bash -s -- precheck' ([System.IO.File]::ReadAllBytes($CoreLocal)))) {
+    $s = [string]$line
+    if ($s -match '^(MISSING_|MISMATCH)') { $PreBad += $s; continue }
+    $i = $s.IndexOf('=')
     if ($i -gt 0) { $Pre[$s.Substring(0, $i)] = $s.Substring($i + 1) }
 }
-if ($SshExit -ne 0 -or $Pre.Count -eq 0) { Die '遠端預檢失敗（服務未變動）' }
-if ($Pre['locked'] -eq '1') { Die '另一個部署正在進行中' }
+if ($SshExit -ne 0 -or $Pre['precheck_done'] -ne '1') { Die "無法連線 $Target 或遠端預檢沒有跑完（沒有 precheck_done=1，服務未變動）" }
+if ($PreBad.Count -gt 0) { $PreBad | ForEach-Object { Write-Host "  $_" }; Die '遠端環境與預期不符（服務未變動）' }
+# 鎖狀態 fail-closed：只有 0 視為未被持有；1（被持有）、unreadable（讀不到，例：鎖檔被以 root 0600 建立）與其他值一律中止
+switch ([string]$Pre['locked']) {
+    '0'          { }
+    '1'          { Die '另一個部署正在進行中' }
+    'unreadable' { Die '讀不到部署鎖檔（權限），無法判斷是否有部署在跑；請檢查鎖檔擁有者與權限' }
+    default      { Die "預檢回報的 locked 值無法辨識：「$($Pre['locked'])」（契約：0／1／unreadable）" }
+}
 $NeedKb = [int64]($Size * 3 / 1024)
 if ($Pre.ContainsKey('disk_avail_kb') -and [int64]$Pre['disk_avail_kb'] -lt $NeedKb) { Die "VM 磁碟可用 $($Pre['disk_avail_kb'])KB，不足產物×3（${NeedKb}KB）" }
 
@@ -118,7 +173,12 @@ if ($Pre.ContainsKey('disk_avail_kb') -and [int64]$Pre['disk_avail_kb'] -lt $Nee
 # 需要的話：遠端腳本另提供唯讀子命令列出現行清單，本機用 System.IO.Compression 讀產物取得新清單後比對。
 # 本骨架不預設實作（判斷條件因產品而異）。
 
-if ($DryRun) { Info 'DryRun：預檢完成，未上傳、未變動任何東西'; exit 0 }
+if ($DryRun) { Info 'DryRun：預檢完成，未在 VM 建目錄、未上傳、未變動任何東西'; exit 0 }
+
+#---------------- 上傳遠端腳本（DryRun 不會走到這裡） ----------------
+Invoke-Ssh "mkdir -p $RemoteStaging" | Out-Null
+if ($SshExit -ne 0) { Die "無法在 VM 建立 $RemoteStaging（服務未變動）" }
+Send-File $CoreLocal $CoreRemote
 
 #---------------- 分段上傳並驗證 ----------------
 $ChunkSize = $ChunkSizeMB * 1MB

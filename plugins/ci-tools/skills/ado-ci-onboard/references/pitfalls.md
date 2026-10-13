@@ -1,8 +1,8 @@
 # 踩坑表：自架 Azure DevOps Server 導入 CI
 
-這 51 條都是實際導入時遇到的問題，不是從文件整理來的。每條都列症狀、根因、解法、驗證狀態。
+這 59 條都是實際導入時遇到的問題，不是從文件整理來的。每條都列症狀、根因、解法、驗證狀態。
 
-第 1～24 條來自第一個導入的專案；第 25～33 條來自第二個專案（Gradle 8.14.3、主 repo＋依賴 repo，接在已經裝好的同一台 server 上）；第 34～44 條來自第三個專案（Gradle 7.5.1、主 repo＋依賴 repo，另有一個獨立 repo，接在同一台 server 上，並做了從 Windows agent 經 SSH 部署到 Linux VM 的 CD）；第 45～51 條來自第四次導入（在一台全新的 Windows Server 2022 上安裝 SQL Server 2025 Express 具名執行個體與 Azure DevOps Server 25H2，再把一個既有專案的 CI／CD 從舊 server 搬過去）。
+第 1～24 條來自第一個導入的專案；第 25～33 條來自第二個專案（Gradle 8.14.3、主 repo＋依賴 repo，接在已經裝好的同一台 server 上）；第 34～44 條來自第三個專案（Gradle 7.5.1、主 repo＋依賴 repo，另有一個獨立 repo，接在同一台 server 上，並做了從 Windows agent 經 SSH 部署到 Linux VM 的 CD）；第 45～51 條來自第四次導入（在一台全新的 Windows Server 2022 上安裝 SQL Server 2025 Express 具名執行個體與 Azure DevOps Server 25H2，再把一個既有專案的 CI／CD 從舊 server 搬過去）；第 52～59 條來自第五次導入（把一個 Gradle 專案的 CI 搬到另一台以 **http** 提供的既有 Azure DevOps Server、在同一台主機新增 agent，並以 Windows agent 經 SSH 部署到 Linux VM 的 CD 跑通 dry-run）。
 
 ## 驗證狀態的意思
 
@@ -108,7 +108,8 @@
 - **根因**：權杖只有讀取範圍。各動作需要的範圍見 SKILL.md「權杖（PAT）與權限範圍」：建專案要 Project and Team（讀寫管理）、建 repo 與推送要 Code（讀寫）、建 pipeline 定義與排入建置要 Build（讀取與執行）。
 - **第三個專案的實例**：同一個權杖能建專案、建 repo、改預設分支，但排入建置回 401，補上 **Build：讀取與執行**後正常；查詢 secure file 清單回 200、上傳卻回 401，補上 **Secure Files：讀取、建立及管理**後正常。「查得到、寫不進」就是範圍問題的典型樣子。
 - **解法**：換用有對應範圍的權杖（servers.yml 的 `pat_env` 指向它），或改用網頁操作。401 還有另一個常見原因是 IIS 基本驗證（第 5 條）：所有權杖、連讀取都 401 時先查第 5 條；只有寫入 401 時查範圍。
-- **驗證狀態**：已遇到（唯讀權杖讀取正常、寫入 401；「各動作對應哪個範圍」是依官方範圍名稱整理，未逐一做對照實驗）
+- **第五次導入的實測**：在另一台 server 上依序遇到並補齊——建專案需「專案與小組：讀取、寫入及管理」；推 repo 與改預設分支需「程式碼：讀取及寫入」；建 pipeline 與排入建置需「建置：讀取及執行」；上傳 secure file 需「安全檔案：讀取、建立及管理」（只有讀取時清單查得到、上傳回 401）。
+- **驗證狀態**：已遇到（唯讀權杖讀取正常、寫入 401；上列四個範圍在第五次導入逐一補上後該動作即成功；授權 `pipelinePermissions` 需要哪個範圍仍未驗證）
 
 ### 34. 用 REST 建 pipeline 回 401，但 pipeline 其實已經建好
 
@@ -130,6 +131,21 @@
 - **根因**：工作群組主機上，ADO 的使用者就是這台主機的本機 Windows 帳號。介面選了非英文語言時，內建群組名稱也會被翻譯（例：繁中介面的「專案集合系統管理員」）。
 - **解法**：新增使用者要先在主機上建立本機 Windows 帳號，再到 ADO 把它加進群組。登入時帳號寫 `<主機名>\<帳號>`；人員選取器搜尋不到時，輸入完整的 `<主機名>\<帳號>`。依文件找群組時，用介面語言的翻譯名稱找。
 - **驗證狀態**：已遇到
+
+### 52. Server 以 http 提供時，agent 設定用 PAT 失敗
+
+- **症狀**：新增 agent 時 `config.cmd --auth pat` 失敗，訊息是 `Basic authentication requires a secure connection to the server.`。
+- **根因**：PAT 走基本驗證，agent 拒絕在非 https 的連線上送出基本驗證（依錯誤訊息判斷，未另做對照實驗）。
+- **解法**：改用 `--auth integrated`：以執行 `config.cmd` 的 Windows 帳號驗證，不需要任何權杖。serverUrl 照抄同一台既有 agent 目錄下 `.agent` 檔的 `serverUrl`（實例是伺服器根網址，形如 `http://ado-host:8080/`，**不含** collection）。完整步驟（只用 ASCII，可直接貼到 Windows 主控台；版本換成既有 agent 的版本）：
+  ```powershell
+  $ver = '4.260.0'
+  Invoke-WebRequest "https://download.agent.dev.azure.com/agent/$ver/vsts-agent-win-x64-$ver.zip" -OutFile "D:\vsts-agent-$ver.zip"
+  Expand-Archive "D:\vsts-agent-$ver.zip" -DestinationPath 'D:\agent2'
+  cd D:\agent2
+  .\config.cmd --unattended --url http://ado-host:8080/ --auth integrated --pool Default --agent agent-02 --work _work --runAsService --windowsLogonAccount "NT AUTHORITY\NETWORK SERVICE"
+  ```
+  加 agent 前先依第 22 條量容量；裝好後第一次建置連線跑（第 38 條）。不要為了設定 agent 請使用者產生權杖；使用者若已在對話或文件中貼出權杖原文，立即提醒撤銷。
+- **驗證狀態**：已遇到（PAT 失敗、integrated 成功；agent 與 ADO 在同一台；4.260.0 的下載網址實際可下載。agent 裝在**另一台**時 integrated 是否可用**未驗證**，〔推測〕需要兩台在同一網域或有相同的本機帳號）
 
 ## Agent 與建置環境
 
@@ -158,8 +174,14 @@
 
 - **症狀**：一個 agent 一次只能跑一個 job，排隊時間長。
 - **根因**：Server 版自架 agent 不收並行費用，並行數等於 agent 數，所以要增加並行就要多裝 agent。
-- **解法**：同一台機器多裝幾個 agent，各自使用不同的資料夾與名稱。記憶體以每個建置 6～8GB 粗估，先開 3～4 個再觀察。會改資料的 E2E（例如 Playwright）不可並行，要放獨立的 pool，或用 `lockBehavior: sequential`。
-- **驗證狀態**：**估計**（6～8GB 是推估值，沒有量測過）。兩個 agent 並行有實際重疊 5 分鐘且都成功，但這不是完整的壓力測試。
+- **解法**：同一台機器多裝幾個 agent，各自使用不同的資料夾與名稱。會改資料的 E2E（例如 Playwright）不可並行，要放獨立的 pool，或用 `lockBehavior: sequential`。
+- **加 agent 前先量容量**（第五次導入）：在建置**進行中**量主機記憶體與前十名程序，不要用閒置時的數字：
+  ```powershell
+  Get-CimInstance Win32_OperatingSystem | Select-Object @{n='TotalGB';e={[math]::Round($_.TotalVisibleMemorySize/1MB,1)}},@{n='FreeGB';e={[math]::Round($_.FreePhysicalMemory/1MB,1)}}
+  Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 10 Name,Id,@{n='WS_GB';e={[math]::Round($_.WorkingSet64/1GB,2)}}
+  ```
+  （給使用者在 Windows 主控台貼上的指令只用 ASCII，見第 53 條。）實例：64GB 主機、兩個建置同時跑時剩 17.5GB；一個 Gradle 建置（daemon `-Xmx3g`＋測試 fork 3G）約佔 9～10GB；同一台還常駐 ADO 的 `w3wp`／`TfsJobAgent`、SQL Server、Oracle。據此只多加 1 個 agent。
+- **驗證狀態**：「每個建置 6～8GB」仍是**估計**；第五次導入**量測**到單一 Gradle 建置（`-Xmx3g`＋測試 fork 3G）約 9～10GB，是單一專案的實測值，不是通則。兩個 agent 並行有實際重疊 5 分鐘且都成功，但這不是完整的壓力測試。
 
 ### 40. agent 內附的 git 是 MinGit，沒有 bash 與常用工具
 
@@ -195,6 +217,27 @@
 - **根因**：agent 與 ADO 裝在同一台時，`config.cmd` 的驗證類型預設是 Integrated（以目前登入的 Windows 帳號驗證），不需要 PAT；agent 裝在別台才需要 PAT。agent 會自行偵測已安裝的 JDK 並登記成能力，不看 `JAVA_HOME`。
 - **解法**：同機安裝時直接用預設的 Integrated。pipeline 的 `demands` 可直接用自動登記的 `jdk_17_x64` 這類能力。agent 以 NETWORK SERVICE 執行時，共用快取目錄（Gradle、npm）要給它修改權限：`icacls <目錄> /grant "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M"`，否則別的帳號放進去的檔案它改不動（同類問題見第 7 條）。
 - **驗證狀態**：Integrated 驗證與 JDK 能力自動偵測為已遇到；快取目錄權限為**未驗證（預防）**，沒有實際發生過寫入失敗
+
+### 54. 重啟 agent 服務會取消正在跑的建置
+
+- **症狀**：為了讓 agent 讀到新的 PATH（例如剛裝了 python，第 57 條）而 `Restart-Service vstsagent*`，正在執行的建置被取消，ADO 記錄「代理程式已收到關機訊號」。
+- **根因**：重啟服務會讓 agent 中止手上的 job。
+- **解法**：請使用者重啟前先確認 agent 閒置：Agent pools → 該 agent 的 Jobs 沒有執行中的項目。判斷執行中的是哪個專案的建置見第 55 條。
+- **驗證狀態**：已遇到
+
+### 55. agent 集區被多個專案共用，建置編號與 pipeline 名稱可能完全相同
+
+- **症狀**：想確認 agent 正在跑哪個建置，看到的建置編號（例：`20261013.3`）與 pipeline 名稱（例：`<repo> CI`）都和自己專案的一樣，差點誤判成「自己已取消的建置卡住 agent」——其實是同一個 collection 裡別的專案的建置。
+- **根因**：`Default` 等 agent 集區屬於 collection，同一個 collection 的專案都可能使用；建置編號預設是日期＋序號，pipeline 名稱預設是 `<repo> CI`，不同專案很容易撞名。
+- **解法**：看該 agent 的 jobrequest 的 `scopeId`（＝專案 id）判斷是哪個專案，不要只看名稱或編號。專案 id 用 `GET {collection}/_apis/projects/<專案>` 取得。
+- **驗證狀態**：已遇到
+
+### 57. agent 的能力清單沒有 python，不代表 agent 找不到 python
+
+- **症狀**：agent 的 systemCapabilities 沒有 `python`（也不一定列出 PATH），容易據此判定 agent 上沒有 python；或主機上明明裝過 python，pipeline 卻找不到。
+- **根因**：能力清單不保證回報 PATH 或 python。另外，裝在使用者個人帳號下的 Python（`AppData\Local\Programs\Python`）只在那個帳號的 PATH 裡，agent 以 NETWORK SERVICE 執行時讀不到。
+- **解法**：用探測 pipeline 實證（`Get-Command python`、`python --version`），不要看能力清單下結論。要給 agent 用就裝成全機共用：`python-3.12.x-amd64.exe /quiet InstallAllUsers=1 PrependPath=1 Include_test=0`（裝在 `C:\Program Files\Python312`），用 `[Environment]::GetEnvironmentVariable("Path","Machine")` 確認系統層 PATH 已含該路徑，再重啟 agent 服務（先確認閒置，第 54 條）。pipeline 裡叫 `python`；這種安裝**沒有** `python3`、`py`。
+- **驗證狀態**：已遇到（全機安裝並重啟 agent 後，探測 pipeline 以 `python` 找得到）
 
 ## 測試執行
 
@@ -322,12 +365,30 @@
 - **解法**：Run 時把分支改成含這個 yaml 的分支；或等 yaml 合進正式分支後再執行。
 - **驗證狀態**：已遇到
 
+### 58. 用 REST 建 pipeline 時，yaml 不在 repo 的預設分支就回 500
+
+- **症狀**：`POST _apis/pipelines`（建立 YAML pipeline）回 500，訊息是找不到檔案；yaml 確實存在，只是在另一個分支（例：預設分支是正式分支，CD 的 yaml 只在測試分支）。
+- **根因**：這個 API 只到 repo 的**預設分支**找 yaml（與第 28 條網頁 Run 預設選預設分支是同一類問題）。
+- **解法**：改用 build definitions API，在 `repository.defaultBranch` 指定含 yaml 的分支，**不必改 repo 的預設分支**：
+  `POST {collection}/<專案>/_apis/build/definitions?api-version=6.0`，body
+  `{"name":"<名稱>","type":"build","queue":{"id":<佇列 id>},"process":{"type":2,"yamlFilename":"/<yaml 路徑>"},"repository":{"id":"<repo id>","name":"<repo 名稱>","type":"TfsGit","defaultBranch":"refs/heads/<含 yaml 的分支>"}}`。
+  佇列 id 用 `GET .../_apis/distributedtask/queues?queueName=Default` 取得。另一個可行但會動到 repo 設定的做法：暫時把 repo 預設分支改成含 yaml 的分支 → 建立 → 改回（另一次操作實際用過）。`scripts/ado-bootstrap-project.sh` 在 pipelines API 回 500、且回應含找不到檔案類訊息時，自動改走 build definitions（腳本的這條路徑只有離線測試）。
+- **驗證狀態**：已遇到（500 → 改用 build definitions 一次成功）。**只證明「建得起來」**：實際建的是 `trigger: none` 的 CD pipeline；body 沒帶 `triggers`，
+  用這個方式建出的定義，yaml 裡的 CI trigger（推送自動觸發）是否生效**未驗證**。建 CI pipeline 時，建完推一次 commit，照第 56 條查有沒有自動觸發
+
 ### 29. 透過 SSH 推送後，CI 觸發有明顯延遲
 
 - **症狀**：推送到 ADO 後，CI 觸發的建置約 30 分鐘後才出現。
 - **根因**：**未釐清**。只觀察到現象，沒有查原因，也不確定每次都會發生。
 - **解法**：急著驗證時直接手動排入建置（網頁 Run，或有 Build 執行權限的權杖呼叫 REST API），不要等觸發。
-- **驗證狀態**：**未釐清**（單次觀察；延遲時間是觀察值，原因與重現條件都未查）
+- **驗證狀態**：**未釐清**（單次觀察；延遲時間是觀察值，原因與重現條件都未查）。第五次導入發現另一種會讓人誤以為「推送沒觸發」的查法錯誤（只看已完成的建置，見第 56 條）；本條的觀察是否也是同一原因**未查證**。
+
+### 56. 判斷「推送後 CI 有沒有自動觸發」只看已完成的建置，會誤判成沒觸發
+
+- **症狀**：推送後查建置清單，前幾筆都是舊的，就判定「SSH 推送不會觸發 CI」，再手動排入一次，結果同一個 commit 跑了兩次。
+- **根因**：剛觸發的建置還在 `notStarted`／`inProgress`，只看已完成清單（或預設排序的前幾筆）看不到它。
+- **解法**：查 `GET .../_apis/build/builds?definitions=<id>&statusFilter=inProgress,notStarted&api-version=6.0`，確認沒有排隊或執行中的建置，才判定沒觸發、才手動排入。
+- **驗證狀態**：已遇到（舊 server 曾因此誤判並多排一次重複建置；事後確認推送觸發的建置早已存在）
 
 ### 36. 推含 azure-pipelines.yml 的新 repo，ADO 會自動建一條 pipeline
 
@@ -348,7 +409,8 @@
 - **症狀**：專案的 Gradle 版本已列在 `cached_gradle_versions`，第一次離線建置仍報 `No cached version of <套件> available for offline mode`。
 - **根因**：第 25 條處理的是「Gradle 版本」層級；但**各專案自己的依賴**（外掛、函式庫）不一定被同一台 agent 下載過。同版本的其他專案建置過，不代表這個專案的套件都在快取裡。
 - **解法**：新專案第一次建置一律連線跑：網頁取消勾選 offline，或 REST 觸發時帶 `templateParameters: {"offline":"false"}`（`scripts/ado-run.sh -p offline=false`）。成功後再用預設的離線模式跑一次，確認之後不用連線也能建置。
-- **驗證狀態**：已遇到（兩個 repo 都是離線失敗 → 連線成功 → 離線成功）
+- **新 agent 也一樣**（第五次導入）：新增的 agent 第一次建置以 `offline=false` 連線下載 Gradle 與相依，之後以 `offline=true` 再跑一次確認快取可用；兩次都是 1764 個測試、0 失敗。
+- **驗證狀態**：已遇到（兩個 repo 都是離線失敗 → 連線成功 → 離線成功；第五次導入的新 agent 連線、離線各一次皆通過）
 
 ### 39. 建立或移動部署分支會立刻觸發一次真正的部署
 
@@ -356,6 +418,13 @@
 - **根因**：建立／更新 ref 等同推送，會觸發 CI。
 - **解法**：先撤銷 pipeline 對部署金鑰（secure file）的授權 → 建立或移動分支 → 自動觸發的建置立刻取消（〔推測〕即使沒取消到，也會卡在等授權或在下載金鑰時失敗，到不了部署步驟；實例都在部署前取消，沒有觀察到這一段） → 恢復授權 → 手動以 dry-run 參數執行。撤銷與恢復都要讀回確認。詳見 `cd-ssh-vm.md`。
 - **驗證狀態**：已遇到（三次建立／移動分支，自動觸發的建置都在部署前取消，部署 stage 為 skipped）
+
+### 59. DownloadBuildArtifacts 的 cleanDestinationFolder 會清掉同一個 job 剛簽出的程式碼
+
+- **症狀**：Deploy job 先 `checkout: self`，再 `DownloadBuildArtifacts@1`（`downloadPath: $(Pipeline.Workspace)`、`cleanDestinationFolder: true`），下一步報找不到 repo 內的路徑。
+- **根因**：`cleanDestinationFolder: true` 會清空**整個** `downloadPath`；指向工作區根目錄時，剛簽出到 `s/<repo>` 的程式碼一起被刪。
+- **解法**：`downloadPath` 一律用專用子目錄（例：`$(Pipeline.Workspace)\artifacts`，檔案在 `<downloadPath>\<artifactName>\`）。`cleanDestinationFolder: true` 建議保留：自架 agent 的工作區跨 run 保留，〔推測〕不清時以 `Get-ChildItem *.war | Select-Object -First 1` 這類寫法找產物，可能挑到上一版的殘留檔。
+- **驗證狀態**：已遇到（改成子目錄後同一條 pipeline 的 dry-run 通過）
 
 ## 同步與操作環境
 
@@ -393,3 +462,10 @@
 - **根因**：改既有頁面必須帶 `If-Match: <ETag>`。〔未查證來源〕一般預期缺少時回 412，這台 server 實際回 500，錯誤訊息看不出原因。
 - **解法**：先 `GET` 該頁、從回應標頭取 `ETag`，再帶 `If-Match` 送 `PUT`（回 200）。
 - **驗證狀態**：已驗證（同一內容不帶 If-Match 回 500、帶了回 200）
+
+### 53. 在 Windows PowerShell 5.1 主控台貼上含中文的指令，中文變亂碼並吃掉引號
+
+- **症狀**：給使用者一段含中文欄位名稱的 PowerShell 指令（例：計算欄位命名為「RAM 總量」），貼到 Windows PowerShell 5.1 互動視窗後中文變亂碼、引號被吃掉，整行解析失敗。
+- **根因**：〔推測〕主控台以系統字碼頁處理貼上的文字，與第 41 條「讀無 BOM 的 `.ps1`」同類；主控台這條路徑的細節未另查。
+- **解法**：給使用者在 Windows 主控台執行的指令**一律只用 ASCII**：欄位名稱用英文（例：`TotalGB`），說明放在指令外的文字裡。需要中文輸出的邏輯寫成 UTF-8 with BOM 的 `.ps1` 檔再執行。
+- **驗證狀態**：已遇到
