@@ -8,6 +8,7 @@
 #   - Build stage 的 job 最後加上「發佈產物」步驟（見下方 BUILD_STAGE_TAIL 註解區塊）
 #   - 部署分支、secure file 名稱、產物檔名、VM 參數依專案填入；不要把實際值寫回公開範本
 #   - ADO Server（自架）不支援 Pipeline Artifacts（task 查得到、執行才報錯），一律用 Build Artifacts
+#   - DownloadBuildArtifacts 的 downloadPath 用專用子目錄（踩坑 59）；「子目錄＋cleanDestinationFolder」這兩行與第五次導入實際跑過 dry-run 的 pipeline 相同
 
 # ---- BUILD_STAGE_TAIL：加在 Build stage 的 job steps 最後 ----
 #      - task: PublishBuildArtifacts@1
@@ -45,7 +46,11 @@ stages:
           buildType: current
           downloadType: single
           artifactName: app
-          downloadPath: $(Pipeline.Workspace)     # 檔案會在 $(Pipeline.Workspace)\app\
+          # 必須是專用子目錄（踩坑 59）：cleanDestinationFolder 會清空整個 downloadPath，
+          # 指向 $(Pipeline.Workspace) 時會連同上面剛簽出的程式碼一起刪掉
+          downloadPath: '$(Pipeline.Workspace)\artifacts'   # 檔案會在 $(Pipeline.Workspace)\artifacts\app\
+          # 自架 agent 的工作區跨 run 保留，不清可能殘留上一版產物
+          cleanDestinationFolder: true
 
       # 連 VM 的 CD 專用私鑰（Library → Secure files）；pipeline 需先被授權使用（pipelinePermissions/securefile）
       - task: DownloadSecureFile@1
@@ -55,7 +60,7 @@ stages:
           secureFile: '<secure file 名稱>'
 
       - powershell: |
-          $artifact = Get-ChildItem '$(Pipeline.Workspace)\app' -Filter '*.war' | Where-Object { $_.Name -notlike '*-plain.war' } | Select-Object -First 1
+          $artifact = Get-ChildItem '$(Pipeline.Workspace)\artifacts\app' -Filter '*.war' | Where-Object { $_.Name -notlike '*-plain.war' } | Select-Object -First 1
           if (-not $artifact) { Write-Host '##vso[task.logissue type=error]找不到產物'; exit 1 }
           $a = @{
             Artifact       = $artifact.FullName
