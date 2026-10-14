@@ -87,6 +87,13 @@ check "core rel 已推到與 Gitea 相同" '[ "$(sha "$AC" rel)" = "$(sha "$GC" 
 check "app dev 已推到與 Gitea 相同" '[ "$(sha "$AA" dev)" = "$(sha "$GA" dev)" ]'
 check "保護分支 main 沒有被推" '[ -z "$(sha "$AA" main)" ]'
 check "保護分支 main 印出指令" 'printf "%s\n" "$OUT" | grep -Eq "push ado $(sha "$GA" main):refs/heads/main"'
+PF="$T/mirrors/pending-protected-pushes.sh"
+check "最後有彙整段，且在所有「### 推送」之後" 'sum=$(printf "%s\n" "$OUT" | grep -n "保護分支待推指令" | cut -d: -f1); last=$(printf "%s\n" "$OUT" | grep -n "^### 推送" | tail -1 | cut -d: -f1); [ -n "$sum" ] && [ "$sum" -gt "$last" ]'
+check "彙整段標出 repo 名稱與指令" 'printf "%s\n" "$OUT" | grep -Eq "^\[app\] .*push ado $(sha "$GA" main):refs/heads/main"'
+check "寫成 <root>/pending-protected-pushes.sh 並印出路徑" '[ -x "$PF" ] && printf "%s\n" "$OUT" | grep -Fq "已寫成：$PF"'
+check "檔案開頭有「未執行」註解、內容只有 main 的 push" 'sed -n 2,5p "$PF" | grep -q "未執行" && [ "$(grep -c "push ado" "$PF")" -eq 1 ] && grep -Eq "push ado $(sha "$GA" main):refs/heads/main" "$PF"'
+check "檔案語法正確（bash -n，不執行）" 'bash -n "$PF"'
+check "檔頭有產生時間與涵蓋的 repo 清單" 'sed -n 2,5p "$PF" | grep -Eq "於 [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} 產生" && sed -n 2,5p "$PF" | grep -q "涵蓋 repo：core app"'
 
 echo "== 情境 3：一個 repo 分叉 → 所有 repo 都不推"
 git -C "$W" checkout -q core-rel; c cr-ado
@@ -119,8 +126,35 @@ check "repo 推不出 ado_url → exit 1 並說明" '[ $RC -eq 1 ] && printf "%s
 OUT="$("${RUN[@]}" --only nope 2>&1)"; RC=$?
 check "--only 指定不存在的 repo → exit 1" '[ $RC -eq 1 ]'
 
-echo "== 情境 6：單 repo 腳本沒有被改動"
-check "sync-gitea-to-ado.sh 與 origin/master 相同" 'git -C "$HERE/.." diff --quiet origin/master -- scripts/sync-gitea-to-ado.sh 2>/dev/null || ! git -C "$HERE/.." rev-parse -q --verify origin/master >/dev/null'
+echo "== 情境 6：wrapper 依賴的單 repo 腳本輸出契約仍成立"
+# sync-all-repos.sh 以文字比對單 repo 腳本的輸出：' 已分叉 (' 判斷分叉、'  …git --git-dir=… push ado <sha>:refs/heads/' 擷取保護分支指令
+ONE="$HERE/../scripts/sync-gitea-to-ado.sh"
+check "單 repo 腳本原始碼仍有「已分叉 (」與「push ado …:refs/heads/」" 'grep -Fq "已分叉 (" "$ONE" && grep -Eq "push ado .*:refs/heads/" "$ONE"'
+OUT="$(bash "$ONE" --gitea "file://$GC" --ado "file://$AC" --workdir "$T/contract-core.git" 2>&1)"
+check "實跑分叉的 core：輸出含 wrapper 比對的「 已分叉 (」" 'printf "%s\n" "$OUT" | grep -q " 已分叉 ("'
+OUT="$(bash "$ONE" --gitea "file://$GA" --ado "file://$AA" --workdir "$T/contract-app.git" --branches main --protected main --apply 2>&1)"
+check "實跑保護分支：指令行符合 wrapper 的擷取格式" 'printf "%s\n" "$OUT" | grep -Eq "^  .*git --git-dir=.* push ado [0-9a-f]+:refs/heads/main$"'
+check "保護分支仍未被推（契約實跑不改動 ADO）" '[ -z "$(sha "$AA" main)" ]'
+
+echo "== 情境 7：未指定 --workdir-root 時，工作 clone 依 <server>/<ado_project> 分目錄"
+X="$T/xdg"
+# 先用單 repo 腳本的舊預設路徑（mirrors/<basename>.git）建一個遠端相同的 app 工作 clone
+XDG_DATA_HOME="$X" bash "$ONE" --gitea "file://$GA" --ado "file://$AA" >/dev/null 2>&1
+DEF=(bash "$ALL" --config "$T/cfg/ci-tools.yml" --servers "$T/cfg/servers.yml")
+OUT="$(XDG_DATA_HOME="$X" "${DEF[@]}" --only app 2>&1)"; RC=$?
+show "$OUT"
+check "預覽 exit 0" '[ $RC -eq 0 ]'
+check "工作 clone 落在 mirrors/local/proj-x/app.git" '[ -f "$X/ci-tools/mirrors/local/proj-x/app.git/HEAD" ] && printf "%s\n" "$OUT" | grep -Fq "工作 clone：$X/ci-tools/mirrors/local/proj-x/app.git"'
+check "舊預設路徑遠端相同 → 印出改用新路徑的提示" 'printf "%s\n" "$OUT" | grep -Fq "提示：舊預設路徑 $X/ci-tools/mirrors/app.git"'
+check "舊預設路徑原封不動（遠端仍指向 app）" '[ "$(git --git-dir="$X/ci-tools/mirrors/app.git" remote get-url gitea)" = "file://$GA" ]'
+
+echo "== 情境 8：沒有保護分支待推 → 不產生檔案"
+sed 's/branches: \[main, dev\]/branches: [dev]/' "$T/cfg/ci-tools.yml" >| "$T/cfg/no-main.yml"
+OUT="$(bash "$ALL" --config "$T/cfg/no-main.yml" --servers "$T/cfg/servers.yml" --workdir-root "$T/mirrors-np" --only app --apply 2>&1)"; RC=$?
+show "$OUT"
+check "exit 0、沒有彙整段、沒有產生檔案" '[ $RC -eq 0 ] && ! printf "%s\n" "$OUT" | grep -q "保護分支待推指令" && [ ! -e "$T/mirrors-np/pending-protected-pushes.sh" ]'
+OUT="$(bash "$ALL" --config "$T/cfg/no-main.yml" --servers "$T/cfg/servers.yml" --workdir-root "$T/mirrors" --only app --apply 2>&1)"; RC=$?
+check "同目錄留有舊檔時提示其已過期" '[ $RC -eq 0 ] && printf "%s\n" "$OUT" | grep -Fq "$PF 是先前執行留下的"'
 
 echo
 echo "結果：通過 ${PASS}、失敗 ${FAIL}"
