@@ -14,8 +14,12 @@
 #   3. 程式碼：預設不動，提示用 sync-all-repos.sh 推送；--import 時對空 repo 用 server 端匯入（未驗證）
 #   4. 預設分支：改成 branches 的第一個（用 repo id，踩坑 18、27）
 #   5. pipeline：main repo 有 /azure-pipelines.yml 且還沒有對應的 pipeline 就建立；建完重新列出確認（踩坑 34、36）。
-#      pipelines API 回 500（yaml 不在 repo 預設分支）時，改用 build/definitions 指定分支建立（踩坑 58）
-#   6. 授權：呼叫 ado-authorize.sh 授權 agent 佇列與依賴 repo（踩坑 35）；secure file 只提示，不自動處理（踩坑 45）
+#      pipelines API 回 500（yaml 不在 repo 預設分支）時，改用 build/definitions 指定分支建立（踩坑 58），
+#      body 一律帶 continuousIntegration trigger（沒帶時 triggers 為 null，推送不會自動建置），建完讀回確認。
+#      已有的 pipeline（含推送 yaml 後 ADO 自動建立的「<repo> CI」）沿用；其 triggers 為空時預覽列出、--apply 補上；
+#      同一個 yaml 有兩條以上定義只警告（同一次推送會建置多次），不自動刪除
+#   6. 授權：呼叫 ado-authorize.sh 授權 agent 佇列、依賴 repo，以及 main repo 本機 azure-pipelines.yml 的
+#      resources.repositories 引用的同專案 repo（踩坑 35）；secure file 只提示，不自動處理（踩坑 45）
 #   7. 環境一致性（只讀）：本機 azure-pipelines.yml 的 JAVA_HOME／GRADLE_USER_HOME／NPM_CONFIG_CACHE
 #      與 servers.yml 的 agent 路徑比對；yaml 與 bin/*.sh 裡出現其他 server 的主機名就列出
 #
@@ -105,6 +109,10 @@ PIPE_API="6.0-preview.1"   # pipelines 端點在 Server 版要用 preview 版本
 IMPORT_API="6.0-preview.1"
 EP_API="6.0-preview.4"
 EP_TYPES_API="6.0-preview.1"
+# build/definitions 建立 YAML pipeline 時要帶的 CI trigger：settingsSourceType 2＝以 yaml 的 trigger 段為準。
+# 沒帶時定義的 triggers 為 null，推送到 yaml trigger 列的分支不會自動建置（2026-10-14 在 Server 6.0 實測，
+# 同一台 server 上可正常觸發的既有定義其 triggers 正是這個值）
+CI_TRIGGERS='[{"branchFilters":[],"pathFilters":[],"settingsSourceType":2,"batchChanges":false,"maxConcurrentBuildsPerBranch":1,"triggerType":"continuousIntegration"}]'
 
 WORK="$(mktemp -d)"
 RESP="$WORK/resp.json"
@@ -464,6 +472,17 @@ load_pipes() {
 }
 # pipe_for <repo id>：指向該 repo 的 /azure-pipelines.yml 的 pipeline id（逗號分隔）
 pipe_for() { awk -F'\t' -v r="$1" 'tolower($3)==tolower(r) && tolower($4)=="/azure-pipelines.yml" {print $1}' "$PIPES_TSV" | paste -sd, -; }
+# read_def <定義 id>：GET build/definitions/<id>，回應留在 ${RESP} 並另存 $WORK/def-<id>.json，印出 HTTP 狀態碼
+read_def() {
+  local code
+  code="$(req GET "$BASE/build/definitions/$1?api-version=$api")"
+  if [ "$code" = 200 ]; then cp "$RESP" "$WORK/def-$1.json"; fi
+  printf '%s' "$code"
+}
+# ci_state：${RESP}（一份定義）的 triggers 含 continuousIntegration 印 ci；triggers 為 null 或空印 empty；其他印 other
+ci_state() {
+  pyjson "t=d.get('triggers') or []; print('ci' if any((x or {}).get('triggerType')=='continuousIntegration' for x in t) else ('empty' if not t else 'other'))"
+}
 
 MAIN_PIPES=""
 SECURE_FILES=""
@@ -491,6 +510,32 @@ for i in "${!N_NAME[@]}"; do
   existing="$(pipe_for "${N_ID[$i]}")"
   if [ -n "$existing" ]; then
     echo "  ${name}：已有指向 /azure-pipelines.yml 的 pipeline（id ${existing}），沿用"
+    case "$existing" in
+      *,*) warn "重複定義：pipeline ${existing} 都指向 ${name} 的 /azure-pipelines.yml，同一次推送會建置多次（常見於推送 yaml 後 ADO 已自動建了「${name} CI」，又另外建了一條）；本腳本不自動刪除，請到網頁刪掉多餘的" ;;
+    esac
+    # 用 build/definitions 建、且 body 沒帶 triggers 的定義，triggers 是 null，推送不會自動建置
+    IFS=',' read -r -a eids <<<"$existing"
+    for eid in "${eids[@]}"; do
+      code="$(read_def "$eid")"
+      [ "$code" = 200 ] || http_fail "$code" "讀取 pipeline ${eid} 的定義（build/definitions）"
+      case "$(ci_state)" in
+        ci) ;;
+        other) warn "pipeline ${eid} 的 triggers 有設定但沒有 continuousIntegration，推送可能不會自動建置；不自動修改，請到網頁確認" ;;
+        empty)
+          echo "  pipeline ${eid}：triggers 為空，推送到 yaml trigger 列的分支不會自動建置"
+          plan "補上 pipeline ${eid} 的 continuousIntegration trigger（PUT 整份定義），讀回確認"
+          if [ "$APPLY" -eq 1 ]; then
+            python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); d["triggers"]=json.loads(sys.argv[3]); json.dump(d, open(sys.argv[2],"w",encoding="utf-8"), ensure_ascii=False)' \
+              "$WORK/def-$eid.json" "$WORK/def-put.json" "$CI_TRIGGERS"
+            code="$(req PUT "$BASE/build/definitions/$eid?api-version=$api" "$WORK/def-put.json")"
+            [ "$code" = 200 ] || http_fail "$code" "補上 pipeline ${eid} 的 trigger"
+            code="$(read_def "$eid")"
+            [ "$code" = 200 ] || mismatch "補上 trigger 後讀回 pipeline ${eid} 失敗（HTTP ${code}）"
+            [ "$(ci_state)" = ci ] || mismatch "補上 trigger 後讀回 pipeline ${eid} 的 triggers 仍沒有 continuousIntegration"
+            echo "    已補上並讀回：pipeline ${eid} 的 triggers 含 continuousIntegration"
+          fi ;;
+      esac
+    done
     MAIN_PIPES="${MAIN_PIPES:+$MAIN_PIPES,}$existing"; N_PIPE[$i]="$existing"
     continue
   fi
@@ -508,7 +553,7 @@ for i in "${!N_NAME[@]}"; do
        && grep -qiE '找不到|not found|could not find|cannot find|does not exist' "$WORK/pipe-post-resp.json"; then
       # 踩坑 58：pipelines API 只到 repo 的預設分支找 yaml，yaml 只在別的分支時回 500「找不到檔案」。
       # 改用 build/definitions 並在 repository.defaultBranch 指定含 yaml 的分支，不必改 repo 的預設分支。
-      # 注意：body 沒帶 triggers，這樣建出的定義 yaml 的 CI trigger 是否生效未驗證（只實測過 trigger: none 的 CD）。
+      # body 一定要帶 triggers：沒帶時定義的 triggers 是 null，推送不會自動建置（2026-10-14 實測）。
       echo "    建立回 HTTP 500 且訊息為找不到檔案，可能是 yaml 不在 repo 預設分支（pipelines API 只到預設分支找），改用 build/definitions 指定分支建立（踩坑 58）"
       cp "$WORK/pipe-post-resp.json" "$RESP"
       head -c 300 "$RESP" | sed 's/^/    回應：/'; echo
@@ -519,7 +564,7 @@ for i in "${!N_NAME[@]}"; do
       [ "$code" = 200 ] || http_fail "$code" "查詢 agent 佇列「${QUEUE}」"
       qid="$(pyjson "v=[q for q in d.get('value',[]) if (q.get('name') or '').lower()==sys.argv[2].lower()]; print(v[0]['id'] if v else '')" "$QUEUE")"
       [ -n "$qid" ] || mismatch "專案裡找不到 agent 佇列「${QUEUE}」（.ci-tools.yml 的 agent_queue）"
-      mkbody "$WORK/def.json" '{"name": a[0] + " CI", "type": "build", "queue": {"id": int(a[2])}, "process": {"type": 2, "yamlFilename": "/azure-pipelines.yml"}, "repository": {"id": a[1], "name": a[0], "type": "TfsGit", "defaultBranch": a[3]}}' "$name" "${N_ID[$i]}" "$qid" "$br"
+      mkbody "$WORK/def.json" '{"name": a[0] + " CI", "type": "build", "queue": {"id": int(a[2])}, "process": {"type": 2, "yamlFilename": "/azure-pipelines.yml"}, "repository": {"id": a[1], "name": a[0], "type": "TfsGit", "defaultBranch": a[3]}, "triggers": json.loads(a[4])}' "$name" "${N_ID[$i]}" "$qid" "$br" "$CI_TRIGGERS"
       pcode="$(req POST "$BASE/build/definitions?api-version=$api" "$WORK/def.json")"
       cp "$RESP" "$WORK/pipe-post-resp.json"
       load_pipes
@@ -536,7 +581,12 @@ for i in "${!N_NAME[@]}"; do
       200|201) echo "    已建立${via}並讀回：pipeline id ${existing}" ;;
       *) echo "    建立${via}回 HTTP ${pcode}，但重新列出已有 pipeline id ${existing}，視為成功（踩坑 34）" ;;
     esac
-    [ -n "$via" ] && warn "pipeline ${existing} 以 build/definitions 建立，yaml 的 CI 自動觸發是否生效未驗證：建完推一次 commit，用 statusFilter=inProgress,notStarted 查有沒有自動觸發（踩坑 56、58）"
+    if [ -n "$via" ]; then
+      code="$(read_def "${existing%%,*}")"
+      [ "$code" = 200 ] || mismatch "以 build/definitions 建立後讀回 pipeline ${existing%%,*} 的定義失敗（HTTP ${code}）"
+      [ "$(ci_state)" = ci ] || mismatch "pipeline ${existing%%,*} 以 build/definitions 建立後讀回的 triggers 沒有 continuousIntegration，推送不會自動建置"
+      echo "    讀回確認：pipeline ${existing%%,*} 的 triggers 已含 continuousIntegration"
+    fi
     MAIN_PIPES="${MAIN_PIPES:+$MAIN_PIPES,}$existing"; N_PIPE[$i]="$existing"
   fi
 done
@@ -600,6 +650,59 @@ while i < len(lines):
 print("yes" if any(n.lower() == want or n.lower().endswith("/" + want) for n in names) else "no")
 PY2
 }
+# yaml_repo_refs <yaml 檔>：列出 resources.repositories 每一項的「type<\x1f>name」（只用標準函式庫的最小解析，不支援 flow 寫法）
+yaml_repo_refs() {
+  python3 - "$1" <<'PY2'
+import re, sys
+lines = open(sys.argv[1], encoding="utf-8-sig", errors="replace").read().splitlines()
+
+def ind(l):
+    return len(l) - len(l.lstrip(" "))
+
+def body(l):
+    return re.sub(r"\s+#.*$", "", l).strip()
+
+entries, i = [], 0
+while i < len(lines):
+    if body(lines[i]) == "resources:":
+        r = ind(lines[i]); i += 1
+        while i < len(lines) and (not body(lines[i]) or ind(lines[i]) > r):
+            if body(lines[i]) == "repositories:":
+                k = ind(lines[i]); i += 1
+                # 項目層級：第一個「-」的縮排是 dash，「-」後第一個鍵的欄位是 keycol；
+                # 只有縮排等於 dash 的「-」算新項目，只有欄位等於 keycol 的鍵屬於該項目，
+                # 更深的內容（例：repository trigger 的 branches: include: 清單）一律略過
+                cur, dash, keycol = None, None, None
+                while i < len(lines):
+                    raw = lines[i]; b = body(raw)
+                    if not b:
+                        i += 1; continue
+                    n = ind(raw)
+                    if n < k or (n == k and not b.startswith("-")):
+                        break
+                    if b.startswith("-") and (dash is None or n == dash):
+                        dash = n
+                        rest = raw[n + 1:]
+                        keycol = n + 1 + len(rest) - len(rest.lstrip(" "))
+                        cur = {}; entries.append(cur)
+                        key_text, col = b[1:].strip(), keycol
+                    else:
+                        key_text, col = b, n
+                    m = re.match(r"^([A-Za-z_]+)\s*:\s*(.*)$", key_text)
+                    if m and cur is not None and col == keycol:
+                        cur.setdefault(m.group(1), m.group(2).strip().strip("'\""))
+                    i += 1
+                continue
+            i += 1
+        continue
+    i += 1
+for e in entries:
+    if e.get("name"):
+        print(e.get("type", ""), e["name"], sep="\x1f")
+PY2
+}
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+DEP_DONE=""   # 依賴迴圈已處理過的「repo:pipeline id」，供下方被引用 repo 段判斷是否要補授權
 if [ -z "$MAIN_PIPES" ]; then
   echo "  還沒有 main repo 的 pipeline，略過授權（pipeline 建好後再執行一次）"
 else
@@ -627,7 +730,56 @@ else
     done
     if [ -n "$pids" ]; then
       ensure_auth --repo "$dep" "依賴 repo「${dep}」" "$pids"
+      IFS=',' read -r -a done_ids <<<"$pids"
+      for p in "${done_ids[@]}"; do DEP_DONE="${DEP_DONE}|$(lower "$dep"):${p}|"; done
     fi
+  done
+  # main repo 本機 yaml 的 resources.repositories 引用、但 .ci-tools.yml 沒標為 dependency 的同專案 repo 也要授權，
+  # 否則建置會停在等授權（例：yaml 引用另一個 main repo）
+  for i in "${!N_NAME[@]}"; do
+    [ -n "${N_PIPE[$i]}" ] || continue
+    yfile="$REPO_ROOT_DIR/${N_NAME[$i]}/azure-pipelines.yml"
+    if [ ! -f "$yfile" ]; then
+      echo "  ${N_ADO[$i]}：本機沒有 azure-pipelines.yml（${yfile}），略過 resources.repositories 引用的 repo 授權"
+      continue
+    fi
+    RT=(); RN=()
+    # 以 \x1f 分隔：type 沒寫時第一欄是空字串，用 tab 會被 read 合併掉而把 name 誤讀成 type
+    while IFS=$'\x1f' read -r rtype rname; do
+      [ -n "$rname" ] || continue
+      RT+=("$rtype"); RN+=("$rname")
+    done < <(yaml_repo_refs "$yfile")
+    if [ "${#RN[@]}" -eq 0 ]; then
+      echo "  ${N_ADO[$i]}：本機 yaml 沒有解析到 resources.repositories，略過被引用 repo 的授權"
+      continue
+    fi
+    for j in "${!RN[@]}"; do
+      rname="${RN[$j]}"
+      if [ "${RT[$j]}" != git ]; then
+        echo "  被引用 repo「${rname}」：type 是「${RT[$j]}」不是 git（ADO 內的 repo），略過"; continue
+      fi
+      if [[ "$rname" != */* ]]; then
+        echo "  被引用 repo「${rname}」：沒有寫成 <專案>/<repo>，略過（需要時用 ado-authorize.sh grant --repo 手動授權）"; continue
+      fi
+      rproj="${rname%%/*}"; rrepo="${rname#*/}"
+      if [ "$(lower "$rproj")" != "$(lower "$PROJECT")" ]; then
+        echo "  被引用 repo「${rname}」：不在專案 ${PROJECT}，略過"; continue
+      fi
+      [ "$(lower "${N_ADO[$i]}")" != "$(lower "$rrepo")" ] || continue   # 引用自己不需要授權
+      # 依賴迴圈讀的是 ADO 預設分支的 yaml；本機 yaml 新增的引用尚未推送時，那裡不會授權給此 pipeline，
+      # 所以只略過依賴迴圈已處理過的 pipeline，其餘在本段補授權
+      want_pids=""
+      IFS=',' read -r -a ref_ids <<<"${N_PIPE[$i]}"
+      for p in "${ref_ids[@]}"; do
+        [[ "$DEP_DONE" == *"|$(lower "$rrepo"):${p}|"* ]] || want_pids="${want_pids:+$want_pids,}$p"
+      done
+      [ -n "$want_pids" ] || continue
+      if [ -z "$(repo_field "$rrepo" id)" ]; then
+        warn "pipeline ${N_PIPE[$i]}（${N_ADO[$i]}）的 yaml 引用 ${rname}，但專案裡沒有這個 repo，無法授權"; continue
+      fi
+      echo "  被引用 repo「${rrepo}」：pipeline ${want_pids}（${N_ADO[$i]}）的本機 yaml 在 resources.repositories 引用它"
+      ensure_auth --repo "$rrepo" "被引用 repo「${rrepo}」" "$want_pids"
+    done
   done
 fi
 echo

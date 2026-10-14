@@ -92,6 +92,8 @@ r queues.json '{"count":1,"value":[{"id":9,"name":"Default"}]}'
 r perm-7.json '{"pipelines":[{"id":7,"authorized":true}]}'
 r perm-8.json '{"pipelines":[{"id":8,"authorized":true}]}'
 r perm-none.json '{"pipelines":[]}'
+# build/definitions 的定義：triggers 含 continuousIntegration（ADO 自動建立或補過 trigger 的樣子）
+r def-ci.json '{"id":7,"name":"app-main CI","revision":3,"triggers":[{"branchFilters":[],"pathFilters":[],"settingsSourceType":2,"batchChanges":false,"maxConcurrentBuildsPerBranch":1,"triggerType":"continuousIntegration"}]}'
 r types-git.json '{"count":1,"value":[{"name":"git","displayName":"Other Git"}]}'
 r ep.json '{"id":"ep-1","name":"ci-tools-import-app-main"}'
 r ir.json '{"importRequestId":5,"status":"queued"}'
@@ -160,6 +162,8 @@ R_PROJ=$'GET\t/_apis/projects/proj-x?\t200\tproject.json'
 R_Q=$'GET\t/distributedtask/queues?queueName=Default\t200\tqueues.json'
 R_CORE=$'GET\t/git/repositories/core-lib?\t200\tcore-main.json'
 R_PERM_PATCH=$'PATCH\t/pipelinePermissions/\t200\tempty.json'
+# 既有 pipeline 會讀 build/definitions 檢查 triggers
+R_DEF=$'GET\t/_apis/build/definitions/\t200\tdef-ci.json'
 
 # ---------------------------------------------------------------- 情境 1：預覽、專案不存在
 scenario "情境 1：預覽模式，專案不存在" \
@@ -216,7 +220,7 @@ scenario "情境 3：--apply 預設分支不對要 PATCH；pipeline 已存在不
   $'GET\t/git/repositories/rid-main/items?\t200\titems.json' \
   $'GET\t/_apis/pipelines?\t200\tpipes-7.json' \
   $'GET\t/_apis/pipelines/7?\t200\tpipe-7.json' \
-  "$R_Q" "$R_CORE" "$R_PERM_PATCH" \
+  "$R_Q" "$R_CORE" "$R_PERM_PATCH" "$R_DEF" \
   $'GET\t/pipelinePermissions/\t200\tperm-none.json,perm-7.json,perm-none.json,perm-7.json'
 OUT="$(bash "$BOOT" --apply "${args[@]}" 2>&1)"; RC=$?
 echo "$OUT" | sed 's/^/    | /'
@@ -238,7 +242,7 @@ R_AUTHED=(
   $'GET\t/git/repositories/rid-main/items?\t200\titems.json'
   $'GET\t/_apis/pipelines?\t200\tpipes-7.json'
   $'GET\t/_apis/pipelines/7?\t200\tpipe-7.json'
-  "$R_Q" "$R_CORE" "$R_PERM_PATCH"
+  "$R_Q" "$R_CORE" "$R_PERM_PATCH" "$R_DEF"
   $'GET\t/pipelinePermissions/\t200\tperm-7.json'
 )
 for mode in preview apply; do
@@ -263,6 +267,7 @@ R_OKREPOS=(
   $'GET\t/refs?api-version\t200\trefs-2.json'
   $'GET\t/git/repositories/rid-main?\t200\tmain-main.json'
   $'GET\t/git/repositories/rid-core?\t200\tcore-main.json'
+  "$R_DEF"
 )
 scenario "情境 4：建立 pipeline 回 401，重新列出已有 → 視為成功" \
   "${R_OKREPOS[@]}" \
@@ -296,12 +301,12 @@ scenario "情境 4c：建立 pipeline 回 500 → 改用 build/definitions 指�
 OUT="$(bash "$BOOT" --apply "${args[@]}" 2>&1)"; RC=$?
 echo "$OUT" | sed -n '/== 5/,/^$/p' | sed 's/^/    | /'
 check "exit 0 並說明改用 build/definitions" '[ $RC -eq 0 ] && echo "$OUT" | grep -q "改用 build/definitions 指定分支建立（踩坑 58）" && echo "$OUT" | grep -q "已建立（build/definitions，分支 refs/heads/main）並讀回：pipeline id 8"'
-check "build/definitions body：佇列 id、yamlFilename、TfsGit、defaultBranch 為 branches 第一個" 'body_of POST "/_apis/build/definitions?" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d=={\"name\":\"app-main CI\",\"type\":\"build\",\"queue\":{\"id\":9},\"process\":{\"type\":2,\"yamlFilename\":\"/azure-pipelines.yml\"},\"repository\":{\"id\":\"rid-main\",\"name\":\"app-main\",\"type\":\"TfsGit\",\"defaultBranch\":\"refs/heads/main\"}}"'
+check "build/definitions body：佇列 id、yamlFilename、TfsGit、defaultBranch 為 branches 第一個" 'body_of POST "/_apis/build/definitions?" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d=={\"name\":\"app-main CI\",\"type\":\"build\",\"queue\":{\"id\":9},\"process\":{\"type\":2,\"yamlFilename\":\"/azure-pipelines.yml\"},\"repository\":{\"id\":\"rid-main\",\"name\":\"app-main\",\"type\":\"TfsGit\",\"defaultBranch\":\"refs/heads/main\"},\"triggers\":[{\"branchFilters\":[],\"pathFilters\":[],\"settingsSourceType\":2,\"batchChanges\":False,\"maxConcurrentBuildsPerBranch\":1,\"triggerType\":\"continuousIntegration\"}]}"'
 check "build/definitions 用 api-version 6.0" 'grep -q "^POST	[^	]*/proj-x/_apis/build/definitions?api-version=6.0	" "$FAKE_LOG"'
 check "沒有改 repo 的預設分支" '! grep -q "^PATCH	[^	]*/git/repositories/" "$FAKE_LOG"'
 check "pipelines 與 build/definitions 各只 POST 一次" '[ "$(grep -c "^POST	.*/_apis/pipelines?" "$FAKE_LOG")" -eq 1 ] && [ "$(grep -c "^POST	.*/build/definitions?" "$FAKE_LOG")" -eq 1 ]'
 check "授權用新的 pipeline id 8" 'grep "^PATCH	.*/pipelinePermissions/queue/9" "$FAKE_LOG" | cut -f3 | grep -q "\"id\": 8"'
-check "訊息用「可能是」，並警告 CI 自動觸發未驗證" 'echo "$OUT" | grep -q "可能是 yaml 不在 repo 預設分支" && echo "$OUT" | grep -q "警告：pipeline 8 以 build/definitions 建立，yaml 的 CI 自動觸發是否生效未驗證"'
+check "訊息用「可能是」，並讀回確認 triggers 含 continuousIntegration" 'echo "$OUT" | grep -q "可能是 yaml 不在 repo 預設分支" && echo "$OUT" | grep -q "讀回確認：pipeline 8 的 triggers 已含 continuousIntegration" && grep -q "^GET	[^	]*/proj-x/_apis/build/definitions/8?api-version=6.0	" "$FAKE_LOG"'
 
 scenario "情境 4d：500 後改用 build/definitions 回 200，但重新列出仍沒有 → exit 2" \
   "${R_OKREPOS[@]}" \
@@ -452,7 +457,7 @@ scenario "情境 10：依賴 repo 只授權給 yaml 有引用它的 pipeline" \
   $'GET\t/_apis/pipelines?\t200\tpipes-79.json' \
   $'GET\t/_apis/pipelines/7?\t200\tpipe-7.json' \
   $'GET\t/_apis/pipelines/9?\t200\tpipe-9.json' \
-  "$R_Q" "$R_CORE" "$R_PERM_PATCH" \
+  "$R_Q" "$R_CORE" "$R_PERM_PATCH" "$R_DEF" \
   $'GET\t/pipelinePermissions/queue/\t200\tperm-none.json,perm-79.json' \
   $'GET\t/pipelinePermissions/repository/\t200\tperm-none.json,perm-7.json'
 OUT="$(bash "$BOOT" --apply --config "$T/ws3/app-main/.ci-tools.yml" --servers "$T/servers.yml" --poll 0 2>&1)"; RC=$?
@@ -463,6 +468,214 @@ check "依賴 repo 只授權給 pipeline 7" 'grep "^PATCH	.*/pipelinePermissions
 check "說明 pipeline 9 沒有引用（名稱只是前綴相同也不算）" 'echo "$OUT" | grep -q "pipeline 9（app-web）的 yaml（ADO 預設分支）沒有引用它，不授權"'
 check "說明 pipeline 7 有引用" 'echo "$OUT" | grep -q "pipeline 7（app-main）的 yaml（ADO 預設分支）在 resources.repositories 引用它"'
 check "本機沒有 yaml 時印「找不到，略過」" 'echo "$OUT" | grep -q "app-main/azure-pipelines.yml：找不到" && echo "$OUT" | grep -q "app-web/azure-pipelines.yml：找不到"'
+check "本機沒有 yaml 時略過被引用 repo 的授權" 'echo "$OUT" | grep -q "app-main：本機沒有 azure-pipelines.yml"'
+
+# ---------------------------------------------------------------- 情境 11～15：CI trigger、重複定義、被引用 repo 授權
+r def-null.json '{"id":7,"name":"app-main CI","revision":3,"triggers":null,"repository":{"id":"rid-main"}}'
+r def-8-null.json '{"id":8,"name":"app-main CI","revision":1,"triggers":null}'
+
+scenario "情境 11：build/definitions 建完讀回 triggers 沒有 continuousIntegration → exit 2" \
+  $'GET\t/_apis/build/definitions/\t200\tdef-8-null.json' \
+  "${R_OKREPOS[@]}" \
+  $'GET\t/git/repositories/rid-main/items?\t200\titems.json' \
+  $'GET\t/_apis/pipelines?\t200\tpipes-none.json,pipes-none.json,pipes-8.json' \
+  $'GET\t/_apis/pipelines/8?\t200\tpipe-8.json' \
+  $'POST\t/_apis/pipelines?\t500\terr-500.json' \
+  $'POST\t/_apis/build/definitions?\t200\tdef-8.json' \
+  "$R_Q"
+OUT="$(bash "$BOOT" --apply "${args[@]}" 2>&1)"; RC=$?
+echo "$OUT" | sed -n '/== 5/,/^$/p' | sed 's/^/    | /'
+check "exit 2 並說明推送不會自動建置" '[ $RC -eq 2 ] && echo "$OUT" | grep -q "pipeline 8 以 build/definitions 建立後讀回的 triggers 沒有 continuousIntegration"'
+check "有讀回 build/definitions/8" 'grep -q "^GET	[^	]*/_apis/build/definitions/8?" "$FAKE_LOG"'
+check "讀回不符就停，不進入授權" '! grep -q "pipelinePermissions" "$FAKE_LOG"'
+
+for mode in preview apply; do
+  scenario "情境 12（${mode}）：既有定義 triggers 為 null → 預覽列出／--apply 以 PUT 補上並讀回" \
+    $'GET\t/_apis/build/definitions/\t200\tdef-null.json,def-ci.json' \
+    $'PUT\t/_apis/build/definitions/7?\t200\tdef-ci.json' \
+    "${R_AUTHED[@]}"
+  if [ "$mode" = apply ]; then OUT="$(bash "$BOOT" --apply "${args[@]}" 2>&1)"; RC=$?; else OUT="$(bash "$BOOT" "${args[@]}" 2>&1)"; RC=$?; fi
+  echo "$OUT" | sed -n '/== 5/,/^$/p' | sed 's/^/    | /'
+  check "exit 0" '[ $RC -eq 0 ]'
+  check "列出 triggers 為空" 'echo "$OUT" | grep -q "pipeline 7：triggers 為空，推送到 yaml trigger 列的分支不會自動建置"'
+  if [ "$mode" = preview ]; then
+    check "預覽只預告、不送 PUT" 'echo "$OUT" | grep -q "\[預覽\] 將補上 pipeline 7 的 continuousIntegration trigger" && ! grep -qvE "^GET	" "$FAKE_LOG"'
+  else
+    check "PUT 到 build/definitions/7（api 6.0），body 是整份定義加上 triggers（保留 revision 與其他欄位）" 'grep -q "^PUT	[^	]*/proj-x/_apis/build/definitions/7?api-version=6.0	" "$FAKE_LOG" && body_of PUT /build/definitions/7 | python3 -c "import json,sys; d=json.load(sys.stdin); assert d[\"revision\"]==3 and d[\"repository\"]=={\"id\":\"rid-main\"} and d[\"triggers\"]==[{\"branchFilters\":[],\"pathFilters\":[],\"settingsSourceType\":2,\"batchChanges\":False,\"maxConcurrentBuildsPerBranch\":1,\"triggerType\":\"continuousIntegration\"}]"'
+    check "PUT 後讀回確認" '[ "$(grep -c "^GET	.*/build/definitions/7?" "$FAKE_LOG")" -eq 2 ] && echo "$OUT" | grep -q "已補上並讀回：pipeline 7 的 triggers 含 continuousIntegration"'
+  fi
+done
+
+scenario "情境 12b：補 triggers 後讀回仍為 null → exit 2" \
+  $'GET\t/_apis/build/definitions/\t200\tdef-null.json' \
+  $'PUT\t/_apis/build/definitions/7?\t200\tdef-null.json' \
+  "${R_AUTHED[@]}"
+OUT="$(bash "$BOOT" --apply "${args[@]}" 2>&1)"; RC=$?
+check "exit 2 並說明讀回不符" '[ $RC -eq 2 ] && echo "$OUT" | grep -q "補上 trigger 後讀回 pipeline 7 的 triggers 仍沒有 continuousIntegration"'
+
+scenario "情境 12c：既有定義已含 CI trigger（例：ADO 推送 yaml 後自動建立的）→ 沿用，不 POST 也不 PUT" "${R_AUTHED[@]}"
+OUT="$(bash "$BOOT" --apply "${args[@]}" 2>&1)"; RC=$?
+check "exit 0、沿用、只讀一次定義、沒有 POST／PUT" '[ $RC -eq 0 ] && echo "$OUT" | grep -q "pipeline（id 7），沿用" && [ "$(grep -c "^GET	.*/build/definitions/7?" "$FAKE_LOG")" -eq 1 ] && ! grep -qE "^(POST|PUT)	" "$FAKE_LOG"'
+check "沒有誤報 triggers 為空或重複定義" '! echo "$OUT" | grep -qE "triggers 為空|重複定義"'
+
+r pipes-78.json '{"count":2,"value":[{"id":7,"name":"app-main CI"},{"id":8,"name":"app-main CI (1)"}]}'
+r perm-78.json '{"pipelines":[{"id":7,"authorized":true},{"id":8,"authorized":true}]}'
+R_DUP=("${R_AUTHED[@]/pipes-7.json/pipes-78.json}")
+R_DUP=("${R_DUP[@]/perm-7.json/perm-78.json}")
+scenario "情境 13：兩條定義指向同一個 yaml → 只警告重複，不刪除、不再建立" \
+  "${R_DUP[@]}" \
+  $'GET\t/_apis/pipelines/8?\t200\tpipe-8.json'
+OUT="$(bash "$BOOT" --apply "${args[@]}" 2>&1)"; RC=$?
+echo "$OUT" | sed -n '/== 5/,/^$/p' | sed 's/^/    | /'
+check "exit 0 並警告重複定義" '[ $RC -eq 0 ] && echo "$OUT" | grep -q "警告：重複定義：pipeline 7,8 都指向 app-main 的 /azure-pipelines.yml，同一次推送會建置多次"'
+check "沒有 DELETE、POST、PUT" '! grep -qE "^(DELETE|POST|PUT)	" "$FAKE_LOG"'
+check "兩條定義都檢查了 triggers" 'grep -q "^GET	.*/build/definitions/7?" "$FAKE_LOG" && grep -q "^GET	.*/build/definitions/8?" "$FAKE_LOG"'
+
+# 被引用 repo：本機 yaml 的 resources.repositories 引用了不在 .ci-tools.yml 的同專案 repo
+mkdir -p "$T/ws4/app-main"
+cp "$T/ws/app-main/.ci-tools.yml" "$T/ws4/app-main/.ci-tools.yml"
+cat >| "$T/ws4/app-main/azure-pipelines.yml" <<'EOF'
+trigger:
+  branches:
+    include: [main]
+resources:
+  repositories:
+  - repository: core   # 依賴 repo，上面已處理
+    type: git
+    name: proj-x/core-lib
+  - repository: tools
+    type: git
+    name: 'proj-x/shared-tools'
+    ref: refs/heads/UAT
+  - repository: other
+    type: git
+    name: OtherProj/x
+  - repository: gh
+    type: github
+    endpoint: gh-conn
+    name: someone/repo
+  - repository: ghost
+    type: git
+    name: proj-x/ghost-repo
+steps:
+- script: echo build
+EOF
+r repos-tools.json '{"value":[{"id":"rid-main","name":"app-main","defaultBranch":"refs/heads/main"},{"id":"rid-core","name":"core-lib","defaultBranch":"refs/heads/main"},{"id":"rid-tools","name":"shared-tools","defaultBranch":"refs/heads/main"}]}'
+r tools.json '{"id":"rid-tools","name":"shared-tools"}'
+for mode in preview apply; do
+  scenario "情境 14（${mode}）：本機 yaml 的 resources.repositories 引用同專案 repo → 一併授權" \
+    "$R_PROJ" \
+    $'GET\t/proj-x/_apis/git/repositories?\t200\trepos-tools.json' \
+    $'GET\t/refs?filter=\t200\trefs-main.json' \
+    $'GET\t/refs?api-version\t200\trefs-2.json' \
+    $'GET\t/git/repositories/rid-main?\t200\tmain-main.json' \
+    $'GET\t/git/repositories/rid-core?\t200\tcore-main.json' \
+    $'GET\t/git/repositories/rid-main/items?\t200\titems.json' \
+    $'GET\t/_apis/pipelines?\t200\tpipes-7.json' \
+    $'GET\t/_apis/pipelines/7?\t200\tpipe-7.json' \
+    "$R_Q" "$R_CORE" "$R_PERM_PATCH" "$R_DEF" \
+    $'GET\t/git/repositories/shared-tools?\t200\ttools.json' \
+    $'GET\t/pipelinePermissions/repository/proj-guid-1.rid-tools\t200\tperm-none.json,perm-7.json' \
+    $'GET\t/pipelinePermissions/\t200\tperm-7.json'
+  if [ "$mode" = apply ]; then
+    OUT="$(bash "$BOOT" --apply --config "$T/ws4/app-main/.ci-tools.yml" --servers "$T/servers.yml" --poll 0 2>&1)"; RC=$?
+  else
+    OUT="$(bash "$BOOT" --config "$T/ws4/app-main/.ci-tools.yml" --servers "$T/servers.yml" --poll 0 2>&1)"; RC=$?
+  fi
+  echo "$OUT" | sed -n '/== 6/,/^$/p' | sed 's/^/    | /'
+  check "exit 0" '[ $RC -eq 0 ]'
+  check "說明 shared-tools 被本機 yaml 引用" 'echo "$OUT" | grep -q "被引用 repo「shared-tools」：pipeline 7（app-main）的本機 yaml 在 resources.repositories 引用它"'
+  check "其他專案、非 git、不存在的 repo 都略過並說明" 'echo "$OUT" | grep -q "OtherProj/x」：不在專案 proj-x，略過" && echo "$OUT" | grep -q "someone/repo」：type 是「github」" && echo "$OUT" | grep -q "警告：pipeline 7（app-main）的 yaml 引用 proj-x/ghost-repo，但專案裡沒有這個 repo"'
+  check "依賴 repo core-lib 不重複處理（只查一次授權），shared-tools 有查授權" '[ "$(grep -c "^GET	.*/pipelinePermissions/repository/proj-guid-1.rid-core" "$FAKE_LOG")" -eq 1 ] && grep -q "^GET	.*/pipelinePermissions/repository/proj-guid-1.rid-tools" "$FAKE_LOG"'
+  if [ "$mode" = preview ]; then
+    check "預覽只預告授權 shared-tools、沒有 PATCH" 'echo "$OUT" | grep -q "\[預覽\] 將授權 pipeline 7 使用被引用 repo「shared-tools」" && ! grep -qvE "^GET	" "$FAKE_LOG"'
+  else
+    check "只對 shared-tools 發一次 PATCH，授權 pipeline 7" '[ "$(grep -c "^PATCH	" "$FAKE_LOG")" -eq 1 ] && grep "^PATCH	.*/pipelinePermissions/repository/proj-guid-1.rid-tools?" "$FAKE_LOG" | cut -f3 | python3 -c "import json,sys; assert json.load(sys.stdin)=={\"pipelines\":[{\"id\":7,\"authorized\":True}]}"'
+  fi
+done
+
+scenario "情境 15：本機 yaml 沒有 resources.repositories → 略過並提示" "${R_AUTHED[@]}"
+OUT="$(bash "$BOOT" "${args[@]}" 2>&1)"; RC=$?
+check "exit 0 並提示沒有解析到" '[ $RC -eq 0 ] && echo "$OUT" | grep -q "app-main：本機 yaml 沒有解析到 resources.repositories，略過被引用 repo 的授權"'
+
+# ---------------------------------------------------------------- 情境 16～17：yaml 巢狀清單、依賴 repo 補授權
+# 項目內有巢狀清單（repository trigger 的 include）、鍵順序不同（name 在 type 前）、多個項目交錯
+R_REF_BASE=(
+  "$R_PROJ"
+  $'GET\t/proj-x/_apis/git/repositories?\t200\trepos-tools.json'
+  $'GET\t/refs?filter=\t200\trefs-main.json'
+  $'GET\t/refs?api-version\t200\trefs-2.json'
+  $'GET\t/git/repositories/rid-main?\t200\tmain-main.json'
+  $'GET\t/git/repositories/rid-core?\t200\tcore-main.json'
+  $'GET\t/_apis/pipelines?\t200\tpipes-7.json'
+  $'GET\t/_apis/pipelines/7?\t200\tpipe-7.json'
+  "$R_Q" "$R_CORE" "$R_PERM_PATCH" "$R_DEF"
+  $'GET\t/git/repositories/shared-tools?\t200\ttools.json'
+)
+mkdir -p "$T/ws5/app-main"
+cp "$T/ws/app-main/.ci-tools.yml" "$T/ws5/app-main/.ci-tools.yml"
+cat >| "$T/ws5/app-main/azure-pipelines.yml" <<'EOF'
+resources:
+  repositories:
+  - repository: core
+    type: git
+    name: proj-x/core-lib
+    trigger:
+      branches:
+        include:
+        - main
+        - UAT
+    ref: refs/heads/main
+  - name: proj-x/shared-tools   # name 在 type 前
+    repository: tools
+    trigger:
+      branches:
+        include:
+          - main
+    type: git
+  - repository: gh
+    type: github
+    endpoint: gh-conn
+    name: someone/repo
+  - repository: notype
+    name: proj-x/no-type
+steps:
+- script: echo build
+EOF
+scenario "情境 16：巢狀 include 清單、鍵順序不同、多項目交錯 → 每項的 type／name 仍正確，shared-tools 照常授權" \
+  "${R_REF_BASE[@]}" \
+  $'GET\t/git/repositories/rid-main/items?\t200\titems.json' \
+  $'GET\t/pipelinePermissions/repository/proj-guid-1.rid-tools\t200\tperm-none.json,perm-7.json' \
+  $'GET\t/pipelinePermissions/\t200\tperm-7.json'
+OUT="$(bash "$BOOT" --apply --config "$T/ws5/app-main/.ci-tools.yml" --servers "$T/servers.yml" --poll 0 2>&1)"; RC=$?
+echo "$OUT" | sed -n '/== 6/,/^$/p' | sed 's/^/    | /'
+check "exit 0" '[ $RC -eq 0 ]'
+check "沒有把巢狀清單當成項目（type 空字串只出現在真的沒寫 type 的 no-type）" '[ "$(echo "$OUT" | grep -c "type 是「」")" -eq 1 ] && ! echo "$OUT" | grep -qE "(shared-tools|core-lib)」：type 是「」"'
+check "github 項目仍被辨認為 github" 'echo "$OUT" | grep -q "someone/repo」：type 是「github」"'
+check "沒寫 type 的項目不會被靜默吞掉（name 不會被誤讀成 type）" 'echo "$OUT" | grep -q "被引用 repo「proj-x/no-type」：type 是「」不是 git"'
+check "name 在 type 前的 shared-tools 仍授權給 pipeline 7（唯一的 PATCH）" '[ "$(grep -c "^PATCH	" "$FAKE_LOG")" -eq 1 ] && grep "^PATCH	.*/pipelinePermissions/repository/proj-guid-1.rid-tools?" "$FAKE_LOG" | cut -f3 | python3 -c "import json,sys; assert json.load(sys.stdin)=={\"pipelines\":[{\"id\":7,\"authorized\":True}]}"'
+
+# 依賴迴圈讀 ADO 預設分支 yaml（沒有引用 core-lib），本機 yaml 新增了引用 → 本段補授權
+mkdir -p "$T/ws6/app-main"
+cp "$T/ws/app-main/.ci-tools.yml" "$T/ws6/app-main/.ci-tools.yml"
+cat >| "$T/ws6/app-main/azure-pipelines.yml" <<'EOF'
+resources:
+  repositories:
+  - repository: core
+    type: git
+    name: proj-x/core-lib
+steps:
+- script: echo build
+EOF
+scenario "情境 17：ADO 上的 yaml 還沒引用依賴 repo、本機 yaml 已引用 → 補授權" \
+  "${R_REF_BASE[@]}" \
+  $'GET\t/git/repositories/rid-main/items?\t200\titems-noref.json' \
+  $'GET\t/pipelinePermissions/repository/proj-guid-1.rid-core\t200\tperm-none.json,perm-7.json' \
+  $'GET\t/pipelinePermissions/\t200\tperm-7.json'
+OUT="$(bash "$BOOT" --apply --config "$T/ws6/app-main/.ci-tools.yml" --servers "$T/servers.yml" --poll 0 2>&1)"; RC=$?
+echo "$OUT" | sed -n '/== 6/,/^$/p' | sed 's/^/    | /'
+check "exit 0" '[ $RC -eq 0 ]'
+check "依賴迴圈依 ADO yaml 不授權，本段依本機 yaml 補授權 core-lib 給 pipeline 7" 'echo "$OUT" | grep -q "依賴 repo「core-lib」：pipeline 7（app-main）的 yaml（ADO 預設分支）沒有引用它，不授權" && echo "$OUT" | grep -q "被引用 repo「core-lib」：pipeline 7（app-main）的本機 yaml" && [ "$(grep -c "^PATCH	.*/pipelinePermissions/repository/proj-guid-1.rid-core?" "$FAKE_LOG")" -eq 1 ]'
 
 echo
 echo "結果：通過 ${PASS}、失敗 ${FAIL}"
