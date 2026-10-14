@@ -1,8 +1,8 @@
 # 踩坑表：自架 Azure DevOps Server 導入 CI
 
-這 59 條都是實際導入時遇到的問題，不是從文件整理來的。每條都列症狀、根因、解法、驗證狀態。
+這 67 條都是實際導入時遇到的問題，不是從文件整理來的。每條都列症狀、根因、解法、驗證狀態。
 
-第 1～24 條來自第一個導入的專案；第 25～33 條來自第二個專案（Gradle 8.14.3、主 repo＋依賴 repo，接在已經裝好的同一台 server 上）；第 34～44 條來自第三個專案（Gradle 7.5.1、主 repo＋依賴 repo，另有一個獨立 repo，接在同一台 server 上，並做了從 Windows agent 經 SSH 部署到 Linux VM 的 CD）；第 45～51 條來自第四次導入（在一台全新的 Windows Server 2022 上安裝 SQL Server 2025 Express 具名執行個體與 Azure DevOps Server 25H2，再把一個既有專案的 CI／CD 從舊 server 搬過去）；第 52～59 條來自第五次導入（把一個 Gradle 專案的 CI 搬到另一台以 **http** 提供的既有 Azure DevOps Server、在同一台主機新增 agent，並以 Windows agent 經 SSH 部署到 Linux VM 的 CD 跑通 dry-run）。
+第 1～24 條來自第一個導入的專案；第 25～33 條來自第二個專案（Gradle 8.14.3、主 repo＋依賴 repo，接在已經裝好的同一台 server 上）；第 34～44 條來自第三個專案（Gradle 7.5.1、主 repo＋依賴 repo，另有一個獨立 repo，接在同一台 server 上，並做了從 Windows agent 經 SSH 部署到 Linux VM 的 CD）；第 45～51 條來自第四次導入（在一台全新的 Windows Server 2022 上安裝 SQL Server 2025 Express 具名執行個體與 Azure DevOps Server 25H2，再把一個既有專案的 CI／CD 從舊 server 搬過去）；第 52～59 條來自第五次導入（把一個 Gradle 專案的 CI 搬到另一台以 **http** 提供的既有 Azure DevOps Server、在同一台主機新增 agent，並以 Windows agent 經 SSH 部署到 Linux VM 的 CD 跑通 dry-run）；第 60～67 條來自第六次導入（同一台 http 的既有 Server，一次接上 5 個 repo：Gradle 7.5.1 主 repo＋依賴 repo、引用同層 repo 前端原始碼的 Gradle repo、Maven＋JDK 17／JDK 8 兩條線並存的 repo、Maven＋JDK 8 的舊專案）。
 
 ## 驗證狀態的意思
 
@@ -239,6 +239,14 @@
 - **解法**：用探測 pipeline 實證（`Get-Command python`、`python --version`），不要看能力清單下結論。要給 agent 用就裝成全機共用：`python-3.12.x-amd64.exe /quiet InstallAllUsers=1 PrependPath=1 Include_test=0`（裝在 `C:\Program Files\Python312`），用 `[Environment]::GetEnvironmentVariable("Path","Machine")` 確認系統層 PATH 已含該路徑，再重啟 agent 服務（先確認閒置，第 54 條）。pipeline 裡叫 `python`；這種安裝**沒有** `python3`、`py`。
 - **驗證狀態**：已遇到（全機安裝並重啟 agent 後，探測 pipeline 以 `python` 找得到）
 
+### 66. Maven：agent 服務的 PATH 沒有 mvn；套件快取每台 agent 各一份，離線預設會失敗
+
+- **症狀**：pipeline 直接寫 `mvn ...` 找不到指令；改好後預設離線（`-o`）的建置，排到沒建置過的 agent 就缺套件。
+- **根因**：Maven 裝在 `C:\Program Files\apache-maven-x.y.z` 且只設了系統變數 `M2_HOME`，沒加進 agent 服務的 PATH（能力清單有 `maven`、`M2_HOME`，PATH 沒有）。
+  套件庫若放在 agent 自己的工作目錄（`$(Agent.WorkFolder)\m2`），集區有幾台 agent 就要各自下載一次。
+- **解法**：以 `call "%M2_HOME%\bin\mvn.cmd" ...` 呼叫，`demands` 加 `maven`；相依都在公開倉庫時預設連線建置（不需 VPN），或改用所有 agent 共用、NetworkService 可寫的套件庫路徑。
+- **驗證狀態**：已遇到（JDK 8 與 JDK 17 的 Maven 建置都以這個寫法在三台 agent 上跑通）
+
 ## 測試執行
 
 ### 9. 測試需要環境變數與設定檔
@@ -285,6 +293,24 @@
 - **根因**：死結本身與 SQL Express 同時寫入有關；**兩邊數字為什麼不同，還沒查清楚**。
 - **解法**：建置成敗以 Gradle 的結果為準；測試分頁的數字可能不完整，不要拿它當唯一依據。
 - **驗證狀態**：**未釐清**（數字差異的原因）
+
+### 61. Windows agent checkout 把文字檔轉成 CRLF，逐位元組比對的測試失敗
+
+- **症狀**：本機（macOS／Linux）全過的黃金樣本測試在 CI 失敗，`ComparisonFailure` 的差異從第一個換行開始。
+- **根因**：repo 內樣本檔是 LF，Windows agent 的 git checkout 轉成 CRLF；測試程式以 `\n` 組字串、以位元組讀樣本檔比對。
+- **解法**：`.gitattributes` 對該樣本檔設 `text eol=lf`，不改測試內容。
+- **驗證狀態**：已驗證（加上 `.gitattributes` 後同一份測試在 CI 通過，Core 103 個測試 0 失敗）
+
+### 62. 測試連到真實資料庫或外部服務，而且可能就在 agent 那台主機
+
+- **症狀**：沒有任何錯誤——CI 綠燈，但測試實際連進了某個真實資料庫。第六次導入在三個專案發現同一類風險：
+  - 測試設定檔的 JDBC 主機與 ADO server／agent 是同一台（CI 跑測試等於直接動到該主機上的正式資料庫）
+  - 測試以 `@ContextConfiguration` 啟動完整 Spring 設定（連資料庫與外部服務），沒有 `@Ignore`
+  - 測試輔助類連 `localhost` 的資料庫且自動建表；在 CI 上 `localhost` 就是 agent 主機
+- **根因**：測試是為開發者本機環境寫的；搬到 CI 後連線目標跟著變，但沒有人重新檢查。
+- **解法**：套範本前先盤點（`ci-discover.sh` 的「測試外部連線」段）。無法確認時第一次 CI **只建置**（Maven `-DskipTests`、Gradle `assemble`）；
+  只跑近期測試的專案，把會連真實資料庫的測試類加進 init script 的排除清單，避免日後有人修改它就被選進 CI。
+- **驗證狀態**：已遇到（三個專案；皆在跑 CI 測試前攔下，未實際連入）
 
 ## 原始碼與建置
 
@@ -373,8 +399,7 @@
   `POST {collection}/<專案>/_apis/build/definitions?api-version=6.0`，body
   `{"name":"<名稱>","type":"build","queue":{"id":<佇列 id>},"process":{"type":2,"yamlFilename":"/<yaml 路徑>"},"repository":{"id":"<repo id>","name":"<repo 名稱>","type":"TfsGit","defaultBranch":"refs/heads/<含 yaml 的分支>"}}`。
   佇列 id 用 `GET .../_apis/distributedtask/queues?queueName=Default` 取得。另一個可行但會動到 repo 設定的做法：暫時把 repo 預設分支改成含 yaml 的分支 → 建立 → 改回（另一次操作實際用過）。`scripts/ado-bootstrap-project.sh` 在 pipelines API 回 500、且回應含找不到檔案類訊息時，自動改走 build definitions（腳本的這條路徑只有離線測試）。
-- **驗證狀態**：已遇到（500 → 改用 build definitions 一次成功）。**只證明「建得起來」**：實際建的是 `trigger: none` 的 CD pipeline；body 沒帶 `triggers`，
-  用這個方式建出的定義，yaml 裡的 CI trigger（推送自動觸發）是否生效**未驗證**。建 CI pipeline 時，建完推一次 commit，照第 56 條查有沒有自動觸發
+- **驗證狀態**：已遇到（500 → 改用 build definitions 一次成功）。**body 不帶 `triggers` 時推送不會自動建置**，已在第六次導入驗證，見第 60 條。
 
 ### 29. 透過 SSH 推送後，CI 觸發有明顯延遲
 
@@ -395,7 +420,9 @@
 - **症狀**：只是推了一個含 `azure-pipelines.yml` 的 repo（例如臨時探測用），pipeline 清單多出一條 `<repo 名稱> CI`。
 - **根因**：ADO 偵測到新 repo 的預設分支有 yaml，自動建立 pipeline 定義。
 - **解法**：刪臨時 repo 時一併刪掉這條自動建立的定義（`DELETE _apis/build/definitions/<id>`）；正式 repo 則注意不要因此出現兩條指向同一個 yaml 的 pipeline。
-- **驗證狀態**：已遇到
+  **推過 yaml 之後才用 REST 建 pipeline，就會變成兩條**（第六次導入實際發生：同一次推送觸發兩次建置，其中一條因未授權佇列一直卡在 `notStarted`）。
+  建 pipeline 前先重新列出定義，已有指向同一個 yaml 的就沿用；自動建立的那條已含 CI trigger，只需補授權（第 35 條）。
+- **驗證狀態**：已遇到（第三次、第六次導入）
 
 ### 37. Server 版不支援 Pipeline Artifacts
 
@@ -425,6 +452,37 @@
 - **根因**：`cleanDestinationFolder: true` 會清空**整個** `downloadPath`；指向工作區根目錄時，剛簽出到 `s/<repo>` 的程式碼一起被刪。
 - **解法**：`downloadPath` 一律用專用子目錄（例：`$(Pipeline.Workspace)\artifacts`，檔案在 `<downloadPath>\<artifactName>\`）。`cleanDestinationFolder: true` 建議保留：自架 agent 的工作區跨 run 保留，〔推測〕不清時以 `Get-ChildItem *.war | Select-Object -First 1` 這類寫法找產物，可能挑到上一版的殘留檔。
 - **驗證狀態**：已遇到（改成子目錄後同一條 pipeline 的 dry-run 通過）
+
+### 60. 用 build definitions API 建的 YAML pipeline，推送不會自動建置
+
+- **症狀**：照第 58 條用 build definitions 建好 pipeline、yaml 也有 `trigger`，推送到觸發分支卻沒有任何建置（照第 56 條查過排隊中與執行中也沒有）。
+- **根因**：body 沒帶 `triggers`，建出的定義 `triggers` 是空的；同一台 server 上能自動觸發的定義，`triggers` 都是
+  `[{"triggerType":"continuousIntegration","settingsSourceType":2,"branchFilters":[],"pathFilters":[],"batchChanges":false,"maxConcurrentBuildsPerBranch":1}]`（`settingsSourceType: 2`＝依 yaml 的 trigger）。
+- **解法**：建立時 body 帶上這段 `triggers`；已建好的用 `GET` 取回整份定義、補上 `triggers` 後 `PUT` 回去，再讀回確認。
+- **驗證狀態**：已驗證（不帶：推送未觸發；補上後之後每次推送都自動建置，兩個 pipeline、多次推送）
+
+### 63. 前端以相對路徑引用同層的另一個 repo，本機能建、CI 不能
+
+- **症狀**：webpack 報 `Module not found: Can't resolve '../../../../../<另一個 repo>/...'`；開發者本機一直正常。
+- **根因**：開發者的工作目錄剛好把兩個 repo 並排放；CI 只簽出自己的 repo。常見於 Storybook 的 `*.stories.js` 被 webpack 一起打包。
+- **解法**：yaml 用 `resources.repositories` 引用該 repo，兩邊都指定 `path` 並排 checkout（相對路徑要對得上），並授權 pipeline 使用該 repo（第 35 條）；
+  被引用的原始碼若 `import` 套件，還要在那個目錄 `npm ci`（套件是依「被引用檔案的位置」往上找 `node_modules`）。`ci-discover.sh` 會列出跳出 repo 根目錄的相對引用。
+- **驗證狀態**：已驗證（並排 checkout＋安裝套件後建置通過）
+
+### 64. webpack-image-placeholder-plugin 把佔位圖產生在「執行它的那份外掛目錄」
+
+- **症狀**：接續第 63 條，被引用 repo 自己的 stories 引用 `60x60.png` 這類佔位圖，報 `Can't resolve '60x60.png'`。
+- **根因**：外掛把圖寫在**執行它的那份**外掛目錄（`path.join(__dirname, 檔名)`），再以 `webpack-image-placeholder-plugin/<檔名>` 從**被引用檔案的位置**解析；
+  CI 新裝的被引用 repo 外掛目錄裡沒有這些圖。開發者本機是被引用 repo 平常自己建置時就產生過了。
+- **解法**：在被引用 repo 的前端目錄 `npm ci` 之後先執行一次它自己的 webpack，再建置主 repo。
+- **驗證狀態**：已驗證（讀外掛原始碼確認機制；加上這一步後建置通過，與本機的警告數相同）
+
+### 65. 舊專案依賴 repo.spring.io 的 milestone 版本，CI 抓不到
+
+- **症狀**：`Could not transfer artifact ... from/to spring-milestones (https://repo.spring.io/libs-milestone): status code: 401`。
+- **根因**：repo.spring.io 的 milestone 倉庫已改成需要帳號；該版本在 Maven Central 與公司 Nexus 都沒有，只存在開發者本機的 `~/.m2`。
+- **解法**：把套件上傳到公司 Nexus 並讓 CI 的 `settings.xml` 指向它；或該分支先不建 CI。新版程式已移除這個相依時，只對新版分支建 CI。
+- **驗證狀態**：已遇到（Central、公司 Nexus 404；repo.spring.io 401）
 
 ## 同步與操作環境
 
@@ -468,4 +526,14 @@
 - **症狀**：給使用者一段含中文欄位名稱的 PowerShell 指令（例：計算欄位命名為「RAM 總量」），貼到 Windows PowerShell 5.1 互動視窗後中文變亂碼、引號被吃掉，整行解析失敗。
 - **根因**：〔推測〕主控台以系統字碼頁處理貼上的文字，與第 41 條「讀無 BOM 的 `.ps1`」同類；主控台這條路徑的細節未另查。
 - **解法**：給使用者在 Windows 主控台執行的指令**一律只用 ASCII**：欄位名稱用英文（例：`TotalGB`），說明放在指令外的文字裡。需要中文輸出的邏輯寫成 UTF-8 with BOM 的 `.ps1` 檔再執行。
+- **驗證狀態**：已遇到
+
+### 67. 不同專案的 repo 同名，同步腳本的工作 clone 互相覆蓋遠端
+
+- **症狀**：沒有錯誤訊息。事後發現另一個專案的工作 clone，`ado`／`gitea` 遠端被改指向這次的專案。
+- **根因**：舊版 `sync-gitea-to-ado.sh` 的預設工作 clone 是 `mirrors/<Gitea 網址最後一段>.git`，而且對既有 clone 直接 `remote set-url`；
+  第六次導入有個 repo 的 Gitea 網址結尾是 `product.git`，與另一個專案的 product 鏡像同名，**第一次預覽**就把對方的遠端改掉了。
+- **解法**：`sync-all-repos.sh` 預設改放 `mirrors/<server>/<ado_project>/<repo>.git`；單 repo 腳本遇到既有 clone 的遠端與本次不同時停止，不覆蓋。
+  **已經被改掉遠端的舊 clone，新版腳本不會自動修**（遇到遠端不同就停止）：改用新的預設路徑（`sync-all-repos.sh` 會依 server／專案分目錄，重新建立 clone），
+  或用 `git --git-dir=<舊 clone> remote set-url <gitea|ado> <正確網址>` 手動改回後再沿用。舊版腳本當時是在下次同步時 `set-url` 並 `fetch --prune` 蓋回去。
 - **驗證狀態**：已遇到

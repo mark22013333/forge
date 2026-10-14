@@ -1,12 +1,14 @@
 # Azure Pipelines 範本：Maven ＋ JDK 25（Windows 自架 agent）
 #
-# 驗證狀態：未驗證。這份範本沒有在任何 ADO 環境實際跑過，只依 gradle17.yml 的已知踩坑類推。
-#           第一次套用時，請照 SKILL.md 第 5 章用 REST API 逐項確認，並把結果回寫到這段標示。
+# 驗證狀態：未驗證（JDK 25）。mvn 呼叫方式與套件庫、連線預設已依第六次導入的 JDK 8／17 實測修正（踩坑 66），
+#           但 JDK 25 本身沒有在任何 ADO 環境跑過。第一次套用時，請照 SKILL.md 第 5 章用 REST API 逐項確認。
 #
 # 套用前要做的事：
 #   1. 把 <...> 佔位符換成專案的值；實際值記在專案自己的 .ci-tools.yml
 #   2. agent 要有 capability 標籤 JDK25
 #   3. 確認專案使用的 Maven 與外掛版本支援 JDK 25
+#   ⚠️ 先跑 ci-discover.sh 看「測試外部連線」：測試會連真實資料庫／外部服務時，把下方 clean verify 改成
+#      clean package -DskipTests（只建置），確認測試不連真實環境後再開（踩坑 62）
 
 trigger:
   branches:
@@ -20,9 +22,9 @@ parameters:
   type: number
   default: 120
 - name: offline
-  displayName: 離線建置（-o）
+  displayName: 離線建置（-o，只用快取）；相依都在公開倉庫時預設連線，套件庫若是各 agent 各一份，離線預設會失敗（踩坑 66）
   type: boolean
-  default: true
+  default: false
 - name: jdkHome
   displayName: JDK 25 路徑
   type: string
@@ -36,6 +38,7 @@ pool:
   name: Default
   demands:
   - JDK25
+  - maven
 
 variables:
 - name: JAVA_HOME
@@ -57,7 +60,7 @@ jobs:
 
   # [推測] 與 maven8.yml 相同：明確指定 -Dmaven.repo.local，不依賴 agent 帳戶的使用者資料夾
   - script: >
-      mvn -B $(offlineFlag) clean verify
+      call "%M2_HOME%\bin\mvn.cmd" -B $(offlineFlag) clean verify
       "-Dmaven.repo.local=${{ parameters.mavenRepoLocal }}"
       -Dsurefire.useFile=false
     displayName: Maven 建置與測試
