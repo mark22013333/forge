@@ -7,7 +7,7 @@ description: 引導把自架 Azure DevOps Server（ADO）接上既有 Gitea 專�
 
 把既有 Gitea 專案接上自架 Azure DevOps Server（以下簡稱 ADO）的 CI。Gitea 仍是主要 repo，ADO 只當 CI 鏡像。
 
-本 skill 的內容來自五次實際導入：第一次從零安裝 Server，第二次接在已經裝好的同一台 Server 上（Gradle 8.14.3、主 repo＋依賴 repo），第三次也接在同一台 Server 上（Gradle 7.5.1、主 repo＋依賴 repo＋另一個獨立 repo），並做了從 Windows agent 經 SSH 部署到 Linux VM 的 CD（第 9 章）；第四次在一台全新的 Windows Server 2022 上安裝 Azure DevOps Server 25H2，並把既有專案的 CI／CD 搬過去；第五次把一個 Gradle 專案搬到另一台以 http 提供的既有 Server、新增 agent，並跑通 CD 的 dry-run。踩過的坑整理在 `references/pitfalls.md`，每條都有驗證狀態。
+本 skill 的內容來自六次實際導入：第一次從零安裝 Server，第二次接在已經裝好的同一台 Server 上（Gradle 8.14.3、主 repo＋依賴 repo），第三次也接在同一台 Server 上（Gradle 7.5.1、主 repo＋依賴 repo＋另一個獨立 repo），並做了從 Windows agent 經 SSH 部署到 Linux VM 的 CD（第 9 章）；第四次在一台全新的 Windows Server 2022 上安裝 Azure DevOps Server 25H2，並把既有專案的 CI／CD 搬過去；第五次把一個 Gradle 專案搬到另一台以 http 提供的既有 Server、新增 agent，並跑通 CD 的 dry-run；第六次在同一台 http 的 Server 上一次接上 5 個 repo（Gradle 主 repo＋依賴 repo、引用同層 repo 前端原始碼的 Gradle repo、Maven 新舊兩條線並存的 repo、Maven＋JDK 8 舊專案）。踩過的坑整理在 `references/pitfalls.md`，每條都有驗證狀態。
 
 ---
 
@@ -30,13 +30,13 @@ description: 引導把自架 Azure DevOps Server（ADO）接上既有 Gitea 專�
 | `cd-templates/probe-agent-ssh.yml` | 已在實際專案跑過（確認 agent 能 TCP 連到 VM 並完成 SSH 握手、列出 agent 上可用的工具） |
 | `cd-templates/probe-agent-ssh-key.yml` | 同結構已在第五次導入跑通（以部署金鑰登入、釘選主機金鑰）；本檔為去識別化版，改寫後未重跑 |
 | `cd-templates/deploy-vm.ps1`、`cd-stage-snippet.yml`、`push-deploy-branch.sh` | **未驗證**：來源專案的 CD 實作已跑通 dry-run 與正式部署，但這三個檔是去識別化改寫版，改寫後未執行過；`push-deploy-branch.sh` 的 `--apply` 連來源版本都沒用過（見 `cd-ssh-vm.md`）。`deploy-vm.ps1` 的預檢經 stdin、dry-run 不寫 VM，與 `cd-stage-snippet.yml` 的 downloadPath 子目錄，都取自第五次導入已跑通 dry-run 的做法 |
-| `pipeline-templates/maven8.yml` | **未驗證** |
-| `pipeline-templates/maven25.yml` | **未驗證** |
+| `pipeline-templates/maven8.yml` | 同結構（`%M2_HOME%` 呼叫 mvn、`demands: maven`、預設連線）已在第六次導入以**寫死的 yaml** 跑通：JDK 8 只編譯打包兩個專案、同寫法的 JDK 17 版含 clean verify 與發佈測試結果。本檔是參數化改寫版，**改寫後未在 ADO 重新執行** |
+| `pipeline-templates/maven25.yml` | **未驗證**（JDK 25 未跑過；mvn 呼叫方式等已依第六次導入的 JDK 8／17 實測修正） |
 | `pipeline-templates/vue.yml` | **未驗證** |
 | `pipeline-templates/python.yml` | **未驗證** |
 | `ci-init.gradle` | 已在最小專案（Gradle 8.14.3）實測：覆寫 `failFast`、`forkEvery`、空清單失敗、只跑清單內測試、排除清單、清單帶 BOM |
 
-四個未驗證範本已改成 `jobs:` 結構並加上 `timeoutInMinutes`，但仍未在任何 ADO 上跑過。套用未驗證的範本時，先告訴使用者它沒有跑過，第一次建置後再依第 5 章確認。
+未驗證的範本已改成 `jobs:` 結構並加上 `timeoutInMinutes`，但仍未在任何 ADO 上跑過。套用未驗證的範本時，先告訴使用者它沒有跑過，第一次建置後再依第 5 章確認。
 
 ## 設定檔（兩層）
 
@@ -106,6 +106,8 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 4. `~/.ssh` 下的金鑰：只用 `.pub` 判斷型別與長度，**不讀私鑰內容**；標出 RSA（ADO 內建 SSH 只收 RSA，踩坑 4）
 5. git 平台：用 `/api/v1/version`（Gitea）、`/api/v4/version`（GitLab）的回應判斷，**不看主機名**（踩坑 31）
 6. 有 server 且權杖變數已設定時，列出 ADO 上的專案與 agent pools
+7. **測試外部連線**（踩坑 62）：先剝除註解，再列出測試設定與測試原始碼裡的 `jdbc:`／`mongodb://`／`redis://` 等連線（只印主機與埠，不印帳密），主機與 servers.yml 的 server 同機標「⚠️ 與 ADO server 同機」、`localhost` 標「CI 上會連到 agent 本機」；另列出會啟動 Spring context 且未 `@Ignore`／`@Disabled` 的測試類
+8. **跨 repo 相對引用**（踩坑 63）：前端檔的相對 `import` 跳出 repo 根目錄者，列出檔案與解析後的目標
 
 最後給建議，依結果分三條路：
 
@@ -156,7 +158,7 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 
 ### 3.1 建立 ADO 專案與 repo
 
-需要 Project and Team（讀取、寫入與管理）與 Code（讀取與寫入）範圍的權杖；範圍不足時改走網頁（見「權杖（PAT）與權限範圍」）。本節到 3.3 的 REST 步驟可以用 `ado-bootstrap-project.sh` 照順序一次做完（第 6A 章，**未在真實 server 驗證**）；以下是手動做法，也是腳本每一步在做的事。以下流程在第二個專案實際做過（已遇到）；`api-version` 依伺服器版本指定，範例用 servers.yml 的 `api_version`。
+需要 Project and Team（讀取、寫入與管理）與 Code（讀取與寫入）範圍的權杖；範圍不足時改走網頁（見「權杖（PAT）與權限範圍」）。本節到 3.3 的 REST 步驟可以用 `ado-bootstrap-project.sh` 照順序一次做完（第 6A 章；步驟 1～4 已在真實 server 跑過，建 pipeline 與依 yaml 授權仍只有離線測試）；以下是手動做法，也是腳本每一步在做的事。以下流程在第二個專案實際做過（已遇到）；`api-version` 依伺服器版本指定，範例用 servers.yml 的 `api_version`。
 
 1. **取得流程範本 id**：用同一台 server 上既有專案的設定，不要自己猜。
 
@@ -202,6 +204,7 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 
 ## 4. 套 pipeline 範本
 
+0. **先看第 0 步的「測試外部連線」**（踩坑 62）：有任何一項時，第一次 CI **只建置**（Maven `clean package -DskipTests`、Gradle `assemble`），確認測試不會連真實資料庫或外部服務後才開測試；只跑近期測試的專案，把會連真實環境的測試類加進 `ci-init.gradle` 的 `EXCLUDED_TESTS`，避免日後有人修改它就被選進 CI。「跨 repo 相對引用」有命中時，用 `resources.repositories` 並排 checkout 被引用的 repo，並在被引用處安裝它自己的 npm 相依（踩坑 63、64）。
 1. **先找同一台 server 上「同建置工具版本、已綠燈」的既有專案 pipeline**（`ci-discover.sh` 會列出其他專案的 `azure-pipelines.yml`，再用第 5 章的 API 確認它最近的建置成功）。有的話以它為底改寫，比通用範本可靠；沒有才依專案類型選 `references/pipeline-templates/` 裡的範本，並告知使用者它的驗證狀態（見上方表格）。
 2. 參數預設值從兩層設定填入：`.ci-tools.yml` 的 `gradle_tasks`、`recent_test_days`、`timeout_minutes`、`offline`，`servers.yml` agent 的 `jdk`、`gradle_user_home`、`npm_cache`。
 3. Gradle 專案：把 `references/ci-init.gradle` 複製到專案的 `ci/ci-init.gradle`，pipeline 以 `--init-script` 載入，**不改專案的 build.gradle**。它會：
@@ -239,6 +242,12 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/scripts/ado-run.sh" --config .ci-tools.yml --pipeline "<pipeline 名稱或 id>" --branch main -p offline=false
 # 輪詢到完成；失敗時印出驗證訊息（validationResults）、失敗步驟名稱與 log 末段。--no-wait 只觸發不等待
+
+# yaml 以 resources.repositories 引用其他 repo 時，可指定被引用 repo 的分支（別名＝yaml 的 repository 欄位；可重複）
+"${CLAUDE_PLUGIN_ROOT}/scripts/ado-run.sh" --config .ci-tools.yml --pipeline <id> --branch <分支> --resource-ref <別名>=UAT
+
+# 推送自動觸發的建置：不另外觸發，只等它跑完並印出結果（buildId 照第 56 條查排隊中／執行中取得）
+"${CLAUDE_PLUGIN_ROOT}/scripts/ado-run.sh" --config .ci-tools.yml --wait-build <buildId>
 ```
 
 判讀時注意：
@@ -308,21 +317,22 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
   "${CLAUDE_PLUGIN_ROOT}/scripts/sync-all-repos.sh" --config .ci-tools.yml --apply    # 套用
   ```
 
-  它逐 repo 呼叫 `sync-gitea-to-ado.sh`（單 repo 腳本的行為一行都沒改，所以另寫包裝腳本而不加 `--config`）。`--apply` 時先把所有 repo 預覽一遍，**任一 repo 有分叉或錯誤，所有 repo 都不推**（結束碼 2 或 1）；推送順序 `dependency` 先、`main` 後。`--only <name>` 只處理指定的 repo。
+  它逐 repo 呼叫 `sync-gitea-to-ado.sh`，工作 clone 預設放在 `mirrors/<server>/<ado_project>/<repo>.git`（`--workdir-root` 可改），避免不同專案的同名 repo 共用同一份 clone（踩坑 67）。`--apply` 時先把所有 repo 預覽一遍，**任一 repo 有分叉或錯誤，所有 repo 都不推**（結束碼 2 或 1）；推送順序 `dependency` 先、`main` 後。`--only <name>` 只處理指定的 repo。
 - 預覽會列出每個分支的狀態：`一致`、`可快轉 (領先 N)`、`ADO 領先 (N)`、`已分叉`、`新分支`、`僅 ADO`、`兩邊皆無`。
 - `--apply` 的規則：
   - 只推 `可快轉` 與 `新分支`，不用強制推送。
   - 只要有一個選定分支是 `已分叉`，**整批都不推**，結束碼 2。請使用者先在 Gitea 端處理，或用 `--branches`（多 repo 時改 `.ci-tools.yml` 的 `branches`）排除該分支。
-  - 保護分支只印出指令，請使用者自己執行（踩坑 24）。
+  - 保護分支只印出指令，請使用者自己執行（踩坑 24）。多 repo 時 `sync-all-repos.sh` 在最後把所有 repo 的待推指令彙整成一段，並寫成 `<工作 clone 根目錄>/pending-protected-pushes.sh`（不會自動執行；沒有待推時不產生）。
+  - 工作 clone 已存在、但其 `gitea`／`ado` 遠端與本次不同時，單 repo 腳本直接停止、不覆蓋遠端（踩坑 67），請改用 `--workdir` 指定別的路徑。
   - 推完自動用 `git ls-remote` 比對兩邊 SHA。
 - `ADO 領先` 表示有人直接推到了 ADO，違反單向原則。回報給使用者，不要自動處理。
-- 工作 clone 預設放在 `${XDG_DATA_HOME:-$HOME/.local/share}/ci-tools/mirrors/`，不放 `/tmp`（踩坑 16）。
+- 工作 clone 預設放在 `${XDG_DATA_HOME:-$HOME/.local/share}/ci-tools/mirrors/<server>/<ado_project>/`（用 `sync-all-repos.sh` 時；單 repo 腳本未指定 `--workdir` 時仍是 `mirrors/<repo>.git`），不放 `/tmp`（踩坑 16）。
 
 ## 6A. 接上新 server／換 server
 
 專案已經在某台 ADO 上跑 CI，要接到另一台（或新專案第一次接上已裝好的 server）時，第 3 章的建專案、建 repo、改預設分支、建 pipeline、授權，可以用 `ado-bootstrap-project.sh` 照順序一次做完。手動做時最容易錯的幾步它都照踩坑處理：預設 repo 改名與改預設分支都用 repo id（踩坑 27）、建 pipeline 回 401 先重新列出（踩坑 34）、已有指向同一個 yaml 的 pipeline 就沿用（踩坑 36）、建完列出名稱以 `.git` 結尾或重複的 repo（踩坑 46）。
 
-**驗證狀態**：腳本只有離線測試（假 curl）；**整支腳本尚未在真實 server 上跑過**，`--import` 那條路徑更是連手動都沒用 REST 做過。第一次使用時先預覽，`--apply` 後到網頁確認結果，並照實告訴使用者這是第一次實跑。
+**驗證狀態**：第六次導入在真實 server 上以 `--apply` 跑過步驟 1～4（建專案並輪詢、預設 repo 改名、新建 repo、改預設分支，皆讀回一致）與步驟 7；**步驟 5 建 pipeline（含 build definitions 改道與補 triggers）、步驟 6 依 yaml 授權被引用 repo 仍只有離線測試**，`--import` 那條路徑連手動都沒用 REST 做過。用到未實跑的步驟時先預覽，`--apply` 後到網頁確認結果，並照實告訴使用者。
 
 ### 步驟
 
@@ -334,7 +344,7 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
    "${CLAUDE_PLUGIN_ROOT}/scripts/ado-bootstrap-project.sh" --config .ci-tools.yml
    ```
 
-4. **套用**：同一行加 `--apply`。每個寫入都會讀回比對，不一致就以結束碼 2 停下；任一步失敗即停。建 pipeline 時 pipelines API 回 500 且回應含找不到檔案類訊息，會自動改用 build definitions 並指定 `branches` 的第一個分支（踩坑 58；這條路徑只有離線測試；這樣建出的定義 CI 自動觸發是否生效未驗證，建完推一次確認）。repo 還沒有內容時，預設分支與 pipeline 兩步會跳過，推送程式碼後**再跑一次**同一行就會補上（已存在的東西一律沿用，可以重複執行）。
+4. **套用**：同一行加 `--apply`。每個寫入都會讀回比對，不一致就以結束碼 2 停下；任一步失敗即停。建 pipeline 時 pipelines API 回 500 且回應含找不到檔案類訊息，會自動改用 build definitions 並指定 `branches` 的第一個分支（踩坑 58），body 一律帶 CI `triggers` 並讀回確認——不帶的話推送不會自動建置（踩坑 60，已驗證）。沿用既有 pipeline 時，`triggers` 為空會在 `--apply` 補上；同一個 yaml 有兩條以上定義（ADO 推 yaml 時會自動建一條，踩坑 36）只警告、不刪除。步驟 6 另外讀本機 yaml 的 `resources.repositories`，把同專案被引用的 repo 一併授權。repo 還沒有內容時，預設分支與 pipeline 兩步會跳過，推送程式碼後**再跑一次**同一行就會補上（已存在的東西一律沿用，可以重複執行）。
 5. **推送程式碼**：預設不動程式碼，用 `sync-all-repos.sh --config .ci-tools.yml --apply`（第 6 章）。大型 repo 可改用 `--import`，由 ADO server 直接從 Git 平台拉（踩坑 46），需要環境變數 `GITEA_USER`、`GITEA_TOKEN`，來源要是 http(s) 網址（repo 的 `import_url`，省略時用 `gitea_url`）。腳本會建一個暫時的 Git 類 service endpoint，匯入結束（成功或失敗）就刪掉。**此路徑未驗證**：endpoint 型別名稱 `git` 不在官方 REST 文件的範例裡，腳本會先向 server 查詢這個型別是否存在。
 6. **上傳 secure file**（有 CD 時）：腳本不處理，只在結尾列出 yaml 引用的 secure file 名稱。第一次建置前先上傳到 **Library → Secure files**，再 `ado-authorize.sh grant --securefile <名稱> --pipelines <id>`，否則整條 pipeline 在驗證階段就失敗（踩坑 45）。
 7. **改 yaml 中與 agent 不一致的路徑**：腳本第 7 步讀本機的 `azure-pipelines.yml`（`.ci-tools.yml` 所在目錄的上一層＋repo 名稱），把 `JAVA_HOME`、`GRADLE_USER_HOME`、`NPM_CONFIG_CACHE` 和 servers.yml 該 server 的 agents 比對，不一致只警告、不改檔。
@@ -390,7 +400,7 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 
 | 檔案 | 內容 |
 |------|------|
-| `references/pitfalls.md` | 59 條踩坑：症狀、根因、解法、驗證狀態 |
+| `references/pitfalls.md` | 67 條踩坑：症狀、根因、解法、驗證狀態 |
 | `references/servers.example.yml` | 使用者層設定範例（server、權杖變數名、agent 路徑、已快取 Gradle 版本） |
 | `references/ci-tools.example.yml` | 專案層設定範例（repos 清單、pipeline 參數、基準分支） |
 | `references/ci-init.gradle` | Gradle CI init script |
@@ -400,9 +410,9 @@ ADO server 常常早就裝好了，資訊散在其他專案的 `azure-pipelines.
 | `references/cd-templates/` | CD 範本：探測 pipeline（不帶金鑰／帶部署金鑰）、agent 端部署腳本、Deploy stage 片段、一鍵觸發腳本 |
 | `${CLAUDE_PLUGIN_ROOT}/scripts/ci-discover.sh` | 第 0 步：唯讀探索既有設定並建議下一步 |
 | `${CLAUDE_PLUGIN_ROOT}/scripts/sync-gitea-to-ado.sh` | Gitea → ADO 單一 repo 單向快轉同步 |
-| `${CLAUDE_PLUGIN_ROOT}/scripts/sync-all-repos.sh` | 依 `.ci-tools.yml` 同步所有 repo（整批把關、依賴先推） |
+| `${CLAUDE_PLUGIN_ROOT}/scripts/sync-all-repos.sh` | 依 `.ci-tools.yml` 同步所有 repo（整批把關、依賴先推；工作 clone 依 server／專案分目錄；保護分支待推指令彙整成 `pending-protected-pushes.sh`） |
 | `${CLAUDE_PLUGIN_ROOT}/scripts/ci-triage.sh` | 首次建置失敗分類：抽出失敗類別、產生本機重跑與基準比對指令 |
-| `${CLAUDE_PLUGIN_ROOT}/scripts/ado-run.sh` | 觸發 pipeline（分支、`templateParameters`）、輪詢至完成、印出失敗步驟 log |
+| `${CLAUDE_PLUGIN_ROOT}/scripts/ado-run.sh` | 觸發 pipeline（分支、`templateParameters`、被引用 repo 的分支 `--resource-ref`）、輪詢至完成、印出失敗步驟 log；`--wait-build` 只等推送已觸發的建置 |
 | `${CLAUDE_PLUGIN_ROOT}/scripts/ado-authorize.sh` | 列出／授權／撤銷 pipeline 對佇列、repo、secure file 的使用權限，寫入後讀回比對 |
-| `${CLAUDE_PLUGIN_ROOT}/scripts/ado-bootstrap-project.sh` | 第 6A 章：依 `.ci-tools.yml` 備好專案、repo、預設分支、pipeline、授權，並比對 agent 路徑（預設只預覽；**未在真實 server 驗證**，`--import` 亦同） |
+| `${CLAUDE_PLUGIN_ROOT}/scripts/ado-bootstrap-project.sh` | 第 6A 章：依 `.ci-tools.yml` 備好專案、repo、預設分支、pipeline、授權，並比對 agent 路徑（預設只預覽；步驟 1～4 已在真實 server 跑過，建 pipeline、依 yaml 授權與 `--import` 未在真實 server 跑過） |
 | `${CLAUDE_PLUGIN_ROOT}/scripts/lib/ci_config.py` | 兩層設定檔的讀取器（無外部依賴） |

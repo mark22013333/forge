@@ -4,6 +4,11 @@
 # 很多時候 ADO server 早就裝好了，資訊散在其他專案的 azure-pipelines.yml、~/.ssh 的金鑰、
 # shell 的環境變數裡。這支腳本把它們找出來，再建議下一步，避免從零開始重裝。
 #
+# 另外在套 pipeline 範本前先揪出兩類風險（純本機掃描、不連線）：
+#   - 測試外部連線：測試設定與測試程式碼裡的連線字串（與 ADO server 同機、agent 本機），
+#     以及會啟動 Spring context 的測試類；連線字串只顯示 scheme、主機、埠，不顯示帳密
+#   - 跨 repo 相對引用：前端檔 import／require／@import 的相對路徑跳出 git repo 根目錄
+#
 # 只做讀取：不改任何設定、不寫使用者目錄；探測回應暫存在 $TMPDIR 的 mktemp 目錄（不自動清理）。
 # 網路只發 GET（Gitea／GitLab 版本端點、ADO 查詢 API）。
 # 權杖只從環境變數讀，不會印出。
@@ -113,6 +118,376 @@ PROJECT_GRADLE=""
 if [ -f "$WRAPPER" ]; then
   PROJECT_GRADLE="$(sed -n 's/.*gradle-\([0-9][0-9.]*[0-9]\)-[a-z]*\.zip.*/\1/p' "$WRAPPER" | head -n1)"
   echo "  Gradle wrapper 版本：${PROJECT_GRADLE:-讀不出來}"
+fi
+
+# ---------------------------------------------------------------- 2a／2b 共用的掃描程式（python，只讀）
+# 以 python3 -c 執行、不用 heredoc：bash 5.1 以前 heredoc 會先寫成 /tmp 暫存檔，違反「只讀」。
+# 因為整段放在 shell 單引號裡，程式內不得出現單引號字元（需要時用 \x27）。
+# 模式：
+#   tests <專案目錄> [ADO 主機網址...]  測試設定與測試程式碼裡的連線字串、會啟動 Spring context 的測試類
+#   xrepo <專案目錄>                     前端檔的相對引用是否跳出 git repo 根目錄
+# 輸出：給人看的行（已縮排兩格），最後一行是「@@HITS=<件數>」供 shell 判斷。
+# 安全：連線字串只輸出 scheme、主機、埠；帳號、密碼、其餘參數一律不輸出。
+SCAN_PY='
+import os, re, stat, sys, time
+from urllib.parse import urlsplit
+
+MAX_DEPTH = 12            # 目錄深度上限（Java 測試套件路徑常見 9～11 層）
+MAX_SIZE = 1024 * 1024    # 單檔超過 1MB 跳過
+TIME_BUDGET = 8.0         # 秒；超過就停止並註明結果不完整
+PRUNE = {"node_modules", ".git", "build", "target", "dist", ".gradle", ".idea",
+         "coverage", ".next", ".nuxt", "storybook-static", ".svn"}
+
+mode, project = sys.argv[1], os.path.abspath(sys.argv[2])
+start = time.monotonic()
+timed_out = False
+
+def walk(root):
+    global timed_out
+    base = root.rstrip(os.sep).count(os.sep)
+    for d, dirs, files in os.walk(root):
+        if time.monotonic() - start > TIME_BUDGET:
+            timed_out = True
+            return
+        depth = d.count(os.sep) - base
+        dirs[:] = sorted(x for x in dirs if x not in PRUNE and not os.path.islink(os.path.join(d, x)))
+        if depth >= MAX_DEPTH:
+            dirs[:] = []
+        for f in sorted(files):
+            p = os.path.join(d, f)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode) and st.st_size <= MAX_SIZE:
+                yield p
+
+def read(p):
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+def keep_newlines(text):
+    return "\n" * text.count("\n")
+
+# 剝除註解（保留換行，行號才對得上）
+C_TOKENS = re.compile(
+    r"(//[^\n]*)"
+    r"|(/\*[\s\S]*?(?:\*/|\Z))"
+    r"|(\"\"\"[\s\S]*?(?:\"\"\"|\Z))"
+    r"|(\"(?:\\.|[^\"\\\n])*\"?)"
+    r"|(\x27(?:\\.|[^\x27\\\n])*\x27?)"
+    r"|(`(?:\\.|[^`\\])*`?)")
+
+def strip_c(text):
+    def repl(m):
+        if m.group(1) is not None:
+            return ""
+        if m.group(2) is not None:
+            return keep_newlines(m.group(2))
+        return m.group(0)
+    return C_TOKENS.sub(repl, text)
+
+def strip_xml(text):
+    return re.sub(r"<!--[\s\S]*?(?:-->|\Z)", lambda m: keep_newlines(m.group(0)), text)
+
+def strip_props(text):
+    out = []
+    for line in text.split("\n"):
+        s = line.lstrip()
+        if s[:1] in ("#", ";", "!"):
+            out.append("")
+        else:
+            # Java .properties 的跳脫寫法：jdbc\:mysql\://h\:3306 還原成 jdbc:mysql://h:3306
+            for a, b in (("\\:", ":"), ("\\=", "="), ("\\#", "#"), ("\\!", "!")):
+                line = line.replace(a, b)
+            out.append(line)
+    return "\n".join(out)
+
+def strip_yaml(text):
+    out = []
+    for line in text.split("\n"):
+        if line.lstrip().startswith("#"):
+            out.append("")
+        else:
+            out.append(re.sub(r"\s#.*$", "", line))
+    return "\n".join(out)
+
+def strip_by_ext(path, text):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".java", ".kt", ".groovy", ".js", ".mjs", ".cjs", ".ts", ".jsx", ".tsx",
+               ".vue", ".svelte", ".scss", ".sass", ".less", ".css"):
+        text = strip_c(text)
+        if ext in (".vue", ".svelte"):
+            text = strip_xml(text)
+        return text
+    if ext == ".xml":
+        return strip_xml(text)
+    if ext in (".yml", ".yaml"):
+        return strip_yaml(text)
+    if ext == ".json":
+        return text
+    return strip_props(text)
+
+def line_of(text, pos):
+    return text.count("\n", 0, pos) + 1
+
+def rel(p):
+    return os.path.relpath(p, project)
+
+def finish(hits):
+    if timed_out:
+        print("  （掃描超過 %d 秒已停止，以上結果不完整）" % TIME_BUDGET)
+    print("@@HITS=%d" % hits)
+
+# ---------------------------------------------------------------- tests 模式
+CONN = re.compile(
+    r"(?<![A-Za-z0-9+])(jdbc:[A-Za-z0-9]+(?::[A-Za-z0-9]+)*|mongodb(?:\+srv)?|rediss?|amqps?|mysql|mariadb|postgres(?:ql)?)"
+    r"://", re.I)
+ORACLE = re.compile(r"(?<![A-Za-z0-9])jdbc:oracle:thin:", re.I)
+HOST = re.compile(r"(\$\{[^}]*\}|\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(?::(\d{1,5}|\$\{[^}]*\}))?")
+# 主機:埠 之後必須緊接這些分隔字元之一（或字串結尾），否則視為無法解析
+DELIMS = set("/;?,#&\"\x27<>)`\\ \t")
+UNPARSED = "<無法解析>"
+SKIP_SCHEME = ("jdbc:h2:mem", "jdbc:hsqldb:mem", "jdbc:derby:memory", "jdbc:tc:", "jdbc:sqlite")
+# 只認註解用法（不認 import 行），行號才會指到類別上的註解
+SPRING = re.compile(r"@(?:[\w.]+\.)?(?:SpringBootTest|ContextConfiguration)\b"
+                    r"|@(?:[\w.]+\.)?RunWith\s*\(\s*(?:[\w.]+\.)?Spring(?:JUnit4ClassRunner|Runner)\b"
+                    r"|@(?:[\w.]+\.)?ExtendWith\s*\(\s*(?:[\w.]+\.)?SpringExtension\b")
+IGNORED = re.compile(r"@(?:[\w.]+\.)?(?:Ignore|Disabled)\b")
+CLASS_DECL = re.compile(r"^[ \t]*(?:(?:public|protected|private|abstract|final|open|internal|static|sealed)\s+)*class\s+(\w+)", re.M)
+TEST_EXT = (".properties", ".yml", ".yaml", ".xml", ".java", ".kt", ".groovy", ".conf", ".cfg", ".ini", ".json")
+MAIN_TEST_EXT = (".properties", ".yml", ".yaml", ".xml")
+CODE_EXT = (".java", ".kt", ".groovy")
+
+def parse_host(candidate, extra_end=""):
+    # candidate 開頭必須是「主機[:埠]」且後面緊接分隔字元；空的視為沒有主機
+    if not candidate or candidate[0] in DELIMS:
+        return "", ""
+    m = HOST.match(candidate)
+    if not m:
+        return UNPARSED, ""
+    after = candidate[m.end():]
+    if after and after[0] not in DELIMS and after[0] not in extra_end:
+        return UNPARSED, ""
+    return m.group(1), m.group(2) or ""
+
+def host_port(rest):
+    # rest：scheme:// 之後到行尾的原文。帳密安全優先，無法確定就回 UNPARSED。
+    # 帳號、密碼可能含任何字元（; ? ) 引號 空白 : / # @），所以：
+    #   - 整段沒有 @ → 沒有帳密，直接解析開頭的主機:埠
+    #   - authority（到第一個分隔字元為止）之後還有 @ → 分不出 @ 屬於密碼還是後面的內容，UNPARSED
+    #   - @ 全部在 authority 內 → 以最後一個 @ 切掉「帳號:密碼」
+    if "@" not in rest:
+        return parse_host(rest)
+    k = next((i for i, ch in enumerate(rest) if ch in DELIMS), len(rest))
+    if "@" in rest[k:]:
+        return UNPARSED, ""
+    return parse_host(rest[:k].rsplit("@", 1)[1])
+
+def oracle_host(rest):
+    # rest：jdbc:oracle:thin: 之後到行尾。格式「[帳號/密碼]@[//]主機:埠…」；@ 不是恰好一個就 UNPARSED
+    if rest.count("@") != 1:
+        return UNPARSED, ""
+    after = rest.split("@", 1)[1]
+    if after.startswith("//"):
+        after = after[2:]
+    return parse_host(after, ":")   # oracle 舊格式「主機:埠:SID」
+
+def rest_of_line(text, pos):
+    end = text.find("\n", pos)
+    return text[pos:] if end < 0 else text[pos:end]
+
+def ado_hosts(urls):
+    names = set()
+    for u in urls:
+        try:
+            h = urlsplit(u).hostname
+        except ValueError:
+            h = None
+        if h:
+            names.add(h.lower())
+    # 只讀 /etc/hosts 補上「名稱 ↔ IP」對應（不查 DNS，不發網路）
+    alias = {}
+    try:
+        with open("/etc/hosts", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                parts = line.split("#", 1)[0].split()
+                if len(parts) >= 2:
+                    group = [x.lower() for x in parts]
+                    for x in group:
+                        alias.setdefault(x, set()).update(group)
+    except OSError:
+        pass
+    expanded = set(names)
+    for n in names:
+        expanded |= alias.get(n, set())
+    return expanded
+
+def classify(host, ado):
+    h = host.lower().strip("[]")
+    if not h:
+        return "未指定主機"
+    if host == UNPARSED:
+        return "無法安全分辨主機與帳密，請人工確認這一行"
+    if h.startswith("${"):
+        return "由變數決定，CI 上的實際值要另外確認"
+    if h in ado:
+        return "⚠️ 與 ADO server 同機：CI 跑測試會直接動到這台機器上的真實服務"
+    if h in ("localhost", "0.0.0.0", "::1") or h.startswith("127."):
+        return "CI 上會連到 agent 本機"
+    return "外部主機：CI agent 連得到就會真的連線"
+
+def is_test_target(r):
+    rr = "/" + r.replace(os.sep, "/")
+    ext = os.path.splitext(r)[1].lower()
+    if "/src/test/" in rr:
+        return ext in TEST_EXT
+    if "/src/main/resources/" in rr:
+        return ext in MAIN_TEST_EXT and "test" in os.path.basename(r).lower()
+    return False
+
+def run_tests(urls):
+    ado = ado_hosts(urls)
+    conns, springs, seen = [], [], set()
+    for p in walk(project):
+        r = rel(p)
+        if not is_test_target(r):
+            continue
+        raw = read(p)
+        if raw is None:
+            continue
+        text = strip_by_ext(p, raw)
+        found = []
+        for m in CONN.finditer(text):
+            scheme = m.group(1)
+            if scheme.lower().startswith(SKIP_SCHEME):
+                continue
+            host, port = host_port(rest_of_line(text, m.end()))
+            found.append((m.start(), scheme + "://", host, port))
+        for m in ORACLE.finditer(text):
+            host, port = oracle_host(rest_of_line(text, m.end()))
+            found.append((m.start(), "jdbc:oracle:thin:@", host, port))
+        for pos, scheme, host, port in found:
+            key = (r, line_of(text, pos), scheme.lower(), host.lower(), port)
+            if key in seen:
+                continue
+            seen.add(key)
+            shown = scheme + (host or "（無主機）") + ((":" + port) if port else "")
+            conns.append("  %s:%d  %s  ← %s" % (r, key[1], shown, classify(host, ado)))
+        if os.path.splitext(p)[1].lower() in CODE_EXT and "/src/test/" in "/" + r.replace(os.sep, "/"):
+            m = SPRING.search(text)
+            if m:
+                c = CLASS_DECL.search(text)
+                head = text[:c.start()] if c else text
+                if not IGNORED.search(head):
+                    name = c.group(1) if c else os.path.splitext(os.path.basename(p))[0]
+                    springs.append("  %s:%d  %s  ← 會啟動 Spring context，可能連外" % (r, line_of(text, m.start()), name))
+    print("  連線字串（已剝除註解；記憶體資料庫不列；只顯示 scheme、主機、埠）：")
+    print("\n".join(conns) if conns else "    （沒有找到）")
+    print("  會啟動 Spring context 的測試類（類別上沒有 @Ignore／@Disabled）：")
+    print("\n".join(springs) if springs else "    （沒有找到）")
+    finish(len(conns) + len(springs))
+
+# ---------------------------------------------------------------- xrepo 模式
+FRONT_EXT = (".js", ".mjs", ".cjs", ".ts", ".jsx", ".tsx", ".vue", ".svelte", ".scss", ".sass", ".less", ".css")
+IMPORT = re.compile(
+    r"(?:\bimport\s*(?:[\w$*{}\s,]{0,1000}?\s*\bfrom\s*)?"
+    r"|\bexport\s+[\w$*{}\s,]{0,1000}?\s*\bfrom\s*"
+    r"|\brequire\s*\(\s*"
+    r"|\bimport\s*\(\s*"
+    r"|@import\s+(?:url\(\s*)?"
+    r"|@use\s+|@forward\s+)"
+    r"([\"\x27])(\.{1,2}/[^\"\x27\n]*)\1")
+_roots = {}
+
+def git_root(d):
+    chain = []
+    cur = d
+    while True:
+        if cur in _roots:
+            found = _roots[cur]
+            break
+        chain.append(cur)
+        if os.path.exists(os.path.join(cur, ".git")):
+            found = cur
+            break
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            found = project
+            break
+        cur = parent
+    for c in chain:
+        _roots[c] = found
+    return found
+
+def run_xrepo():
+    hits = []
+    for p in walk(project):
+        if os.path.splitext(p)[1].lower() not in FRONT_EXT:
+            continue
+        raw = read(p)
+        if raw is None:
+            continue
+        text = strip_by_ext(p, raw)
+        root = git_root(os.path.dirname(p))
+        for m in IMPORT.finditer(text):
+            spec = m.group(2)
+            target = os.path.normpath(os.path.join(os.path.dirname(p), spec))
+            if target == root or target.startswith(root + os.sep):
+                continue
+            outside = os.path.relpath(target, os.path.dirname(root)).split(os.sep)[0]
+            where = ("repo 外的 %s" % outside) if outside != ".." else "repo 上層目錄之外"
+            hits.append("  %s:%d  \"%s\" → %s（%s）" % (rel(p), line_of(text, m.start(2)), spec, target, where))
+    print("\n".join(hits) if hits else "  （沒有找到）")
+    finish(len(hits))
+
+if mode == "tests":
+    run_tests(sys.argv[3:])
+elif mode == "xrepo":
+    run_xrepo()
+else:
+    sys.exit("未知模式：" + mode)
+'
+scan() { python3 -c "$SCAN_PY" "$@"; }
+# 執行掃描並拆出件數：輸出存進 SCAN_OUT、件數存進 SCAN_HITS（掃描失敗時件數為 0 並印出原因）
+run_scan() {
+  local out
+  if out="$(scan "$@" 2>&1)"; then
+    SCAN_HITS="$(printf '%s\n' "$out" | sed -n 's/^@@HITS=\([0-9]*\)$/\1/p' | tail -n1)"
+    SCAN_OUT="$(printf '%s\n' "$out" | sed '/^@@HITS=/d')"
+  else
+    SCAN_HITS=0
+    SCAN_OUT="  （掃描失敗：$(printf '%s' "$out" | tail -n1)）"
+  fi
+  SCAN_HITS="${SCAN_HITS:-0}"
+}
+
+# ---------------------------------------------------------------- 2a. 測試外部連線
+section "測試外部連線（套範本前先確認 CI 跑測試會連到哪裡；只讀、不連線）"
+ADO_URLS=()
+while IFS=$'\x1f' read -r name url _coll _pat _key ssh_url _api; do
+  [ -n "$name" ] || continue
+  ADO_URLS+=("$url" "$ssh_url")
+done <<<"$SERVER_ROWS"
+run_scan tests "$PROJECT_DIR" "${ADO_URLS[@]+"${ADO_URLS[@]}"}"
+printf '%s\n' "$SCAN_OUT"
+if [ "$SCAN_HITS" -gt 0 ]; then
+  TEST_TIP="第一次建 CI 建議先只建置（-DskipTests／gradle assemble），確認測試不連真實環境再開測試。"
+  echo "  建議：$TEST_TIP"
+  advise "測試會連外（見「測試外部連線」）→ $TEST_TIP"
+fi
+
+# ---------------------------------------------------------------- 2b. 跨 repo 相對引用
+section "跨 repo 相對引用（前端檔的 import／require／@import 跳出 git repo 根目錄）"
+run_scan xrepo "$PROJECT_DIR"
+printf '%s\n' "$SCAN_OUT"
+if [ "$SCAN_HITS" -gt 0 ]; then
+  XREPO_TIP="CI 需並排 checkout 該 repo（resources.repositories），並注意被引用處自身的 npm 相依。"
+  echo "  建議：$XREPO_TIP"
+  advise "前端有跨 repo 相對引用（見「跨 repo 相對引用」）→ $XREPO_TIP"
 fi
 
 # ---------------------------------------------------------------- 3. 其他專案的 CI 設定

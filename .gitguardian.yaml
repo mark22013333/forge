@@ -1,0 +1,8 @@
+# GitGuardian／ggshield 設定（v2）
+# ci-discover.test.sh 的「不得外洩帳密」測試刻意放入假帳密（.invalid 網域、192.0.2.x 文件專用 IP、usrQ*／pwZ 佔位值），
+# 用來驗證 ci-discover.sh 不會把帳密印出來；全部是虛構值，不是真實秘密。
+# 注意：本檔只對 ggshield（CLI／pre-commit）生效；GitHub App 的 PR check 以 dashboard 的 excluded filepaths 為準。
+version: 2
+secret:
+  ignored_paths:
+    - 'plugins/ci-tools/tests/ci-discover.test.sh'

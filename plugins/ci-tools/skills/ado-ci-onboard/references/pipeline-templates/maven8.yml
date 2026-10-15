@@ -1,11 +1,14 @@
 # Azure Pipelines 範本：Maven ＋ JDK 8（Windows 自架 agent）
 #
-# 驗證狀態：未驗證。這份範本沒有在任何 ADO 環境實際跑過，只依 gradle17.yml 的已知踩坑類推。
-#           第一次套用時，請照 SKILL.md 第 5 章用 REST API 逐項確認，並把結果回寫到這段標示。
+# 驗證狀態：同結構已在第六次導入以寫死的 yaml 跑通（Maven 3.9.9＋JDK 8 只編譯打包兩個專案；同寫法的 JDK 17 版含
+#           clean verify 與發佈測試結果）。本檔是參數化的改寫版，改寫後**未在 ADO 重新執行**。
+#           第一次套用時，請照 SKILL.md 第 5 章用 REST API 逐項確認。
 #
 # 套用前要做的事：
 #   1. 把 <...> 佔位符換成專案的值；實際值記在專案自己的 .ci-tools.yml
 #   2. agent 要有 capability 標籤 JDK8
+#   ⚠️ 先跑 ci-discover.sh 看「測試外部連線」：測試會連真實資料庫／外部服務時，把下方 clean verify 改成
+#      clean package -DskipTests（只建置），確認測試不連真實環境後再開（踩坑 62）
 
 trigger:
   branches:
@@ -19,9 +22,9 @@ parameters:
   type: number
   default: 120
 - name: offline
-  displayName: 離線建置（-o）
+  displayName: 離線建置（-o，只用快取）；相依都在公開倉庫時預設連線，套件庫若是各 agent 各一份，離線預設會失敗（踩坑 66）
   type: boolean
-  default: true
+  default: false
 - name: jdkHome
   displayName: JDK 8 路徑
   type: string
@@ -35,6 +38,7 @@ pool:
   name: Default
   demands:
   - JDK8
+  - maven
 
 variables:
 - name: JAVA_HOME
@@ -54,10 +58,11 @@ jobs:
   - checkout: self
     fetchDepth: 0
 
+  # mvn 通常不在 agent 服務的 PATH，以 M2_HOME 的完整路徑呼叫（踩坑 66）
   # [推測] agent 以 NetworkService 執行時沒有使用者資料夾（踩坑 7 是 npm 的同類問題），
   # 所以明確指定 -Dmaven.repo.local，不依賴 ~/.m2
   - script: >
-      mvn -B $(offlineFlag) clean verify
+      call "%M2_HOME%\bin\mvn.cmd" -B $(offlineFlag) clean verify
       "-Dmaven.repo.local=${{ parameters.mavenRepoLocal }}"
       -Dsurefire.useFile=false
     displayName: Maven 建置與測試

@@ -123,6 +123,56 @@ check "缺 --gitea 時 exit 非 0" '[ $RC -ne 0 ]'
 OUT="$(bash "$SYNC" --gitea "$GU" --ado "$AU" --workdir "$WD" --branches nope 2>&1)"; RC=$?
 check "指定不存在的分支 → 回報且 exit 非 0" '[ $RC -ne 0 ] && echo "$OUT" | grep -Eq "^nope +兩邊皆無"'
 
+echo "== 情境 7：既有工作 clone 的遠端與本次不同 → 中止且不覆蓋（跨專案同名撞路徑）"
+OG="$T/other-gitea.git"; OA="$T/other-ado.git"
+git init -q --bare "$OG"; git init -q --bare "$OA"
+remote_of() { git --git-dir="$WD" remote get-url "$1"; }
+OUT="$(bash "$SYNC" --gitea "file://$OG" --ado "$AU" --workdir "$WD" 2>&1)"; RC=$?
+echo "$OUT" | sed 's/^/    | /'
+check "gitea 遠端不同 → exit 非 0" '[ $RC -ne 0 ]'
+check "錯誤訊息列出既有與本次網址並建議 --workdir" 'echo "$OUT" | grep -Fq "既有：$GU" && echo "$OUT" | grep -Fq "本次：file://$OG" && echo "$OUT" | grep -q -- "--workdir"'
+check "gitea 遠端未被改寫（讀回仍是原網址）" '[ "$(remote_of gitea)" = "$GU" ]'
+OUT="$(bash "$SYNC" --gitea "$GU" --ado "file://$OA" --workdir "$WD" 2>&1)"; RC=$?
+check "只有 ado 遠端不同也 exit 非 0" '[ $RC -ne 0 ] && echo "$OUT" | grep -Fq "本次：file://$OA"'
+check "ado 遠端未被改寫（讀回仍是原網址）" '[ "$(remote_of ado)" = "$AU" ]'
+check "未跑 fetch（輸出沒有分支狀態列）" '! echo "$OUT" | grep -Eq "^same +"'
+
+echo "== 情境 8：既有工作 clone 的遠端與本次相同 → 照常執行"
+OUT="$(bash "$SYNC" --gitea "$GU" --ado "$AU" --workdir "$WD" 2>&1)"; RC=$?
+check "相同遠端 exit 0 且 same＝一致" '[ $RC -eq 0 ] && echo "$OUT" | grep -Eq "^same +一致$"'
+check "遠端維持不變" '[ "$(remote_of gitea)" = "$GU" ] && [ "$(remote_of ado)" = "$AU" ]'
+
+echo "== 情境 9：使用者 gitconfig 有 insteadOf → 同一 repo 重跑不得誤判撞名"
+# 測試專用 gitconfig（不碰使用者真實的 ~/.gitconfig）：短別名 tst: 改寫成本機 bare repo 路徑
+GC_IO="$T/gitconfig-insteadof"
+printf '[url "file://%s/"]\n\tinsteadOf = tst:\n' "$T" >| "$GC_IO"
+WDI="$T/mirror-insteadof.git"
+OUT="$(GIT_CONFIG_GLOBAL="$GC_IO" bash "$SYNC" --gitea tst:gitea.git --ado tst:ado.git --workdir "$WDI" 2>&1)"; RC=$?
+check "第一次（全新 clone）exit 0 且透過別名讀到 same＝一致" '[ $RC -eq 0 ] && echo "$OUT" | grep -Eq "^same +一致$"'
+OUT="$(GIT_CONFIG_GLOBAL="$GC_IO" bash "$SYNC" --gitea tst:gitea.git --ado tst:ado.git --workdir "$WDI" 2>&1)"; RC=$?
+echo "$OUT" | sed 's/^/    | /'
+check "第二次（既有 clone、網址相同）exit 0，未被判為撞名" '[ $RC -eq 0 ] && ! echo "$OUT" | grep -q "遠端網址與本次不同"'
+check "遠端仍存原始別名網址" '[ "$(git --git-dir="$WDI" config --get remote.gitea.url)" = "tst:gitea.git" ]'
+
+echo "== 情境 10：衝突訊息遮掉網址內嵌的帳密"
+WDP="$T/mirror-pat.git"
+git init -q --bare "$WDP"
+git --git-dir="$WDP" remote add gitea "https://u:OLDSECRET123@gitea.invalid/team/a.git"
+git --git-dir="$WDP" remote add ado "$AU"
+# 網址不同 → 在 fetch 之前就中止，不會連到 .invalid 主機
+OUT="$(bash "$SYNC" --gitea "https://u:NEWSECRET456@gitea.invalid/team/b.git" --ado "$AU" --workdir "$WDP" 2>&1)"; RC=$?
+echo "$OUT" | sed 's/^/    | /'
+check "exit 非 0 且仍列出遮罩後的既有／本次網址" '[ $RC -ne 0 ] && echo "$OUT" | grep -Fq "既有：https://***@gitea.invalid/team/a.git" && echo "$OUT" | grep -Fq "本次：https://***@gitea.invalid/team/b.git"'
+check "輸出不含任何密碼" '! echo "$OUT" | grep -Eq "OLDSECRET123|NEWSECRET456"'
+
+echo "== 情境 11：保護分支指令的路徑以 %q 跳脫（會被寫進可執行檔）"
+WDD="$T/mir\$HOME\`x\`.git"
+OUT="$(bash "$SYNC" --gitea "$GU" --ado "$AU" --workdir "$WDD" --branches main --apply 2>&1)"; RC=$?
+LINE="$(echo "$OUT" | grep -E "push ado [0-9a-f]+:refs/heads/main" | sed "s/^  //")"
+echo "    | $LINE"
+check "exit 0 且印出指令" '[ $RC -eq 0 ] && [ -n "$LINE" ]'
+check "指令經 shell 解析後 --git-dir 仍是原路徑（\$ 與反引號沒被展開）" '[ "$(bash -c "set -- $LINE; echo \"\$2\"" 2>/dev/null)" = "--git-dir=$WDD" ]'
+
 echo
 echo "結果：通過 ${PASS}、失敗 ${FAIL}"
 [ "$FAIL" -eq 0 ]

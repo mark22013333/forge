@@ -2,15 +2,22 @@
 # ado-run.sh — 以 REST API 觸發 ADO pipeline（可帶 templateParameters），輪詢到完成，失敗時印出驗證訊息與失敗步驟的 log
 #
 # 會對 ADO 送出一個寫入動作：排入一次執行（POST pipelines/<id>/runs）。其餘只發 GET。
+# --wait-build 不觸發，只等一個已存在的建置（例：推送自動觸發的那次），只發 GET。
 # 權杖只從環境變數讀（servers.yml 的 pat_env），以 curl 設定檔從 stdin 傳入，不出現在指令列，也不會印出。
 #
 # 用法：
 #   ado-run.sh --pipeline <名稱或 id> [選項]
+#   ado-run.sh --wait-build <建置 id> [--poll <秒>] [--timeout <分>] [設定選項]
 #
 # 選項：
 #   --pipeline <名稱|id>  要執行的 pipeline（必填；名稱需完全相符）
 #   --branch <分支>       執行的分支（例：main 或 refs/heads/main；省略時用 pipeline 的預設分支）
 #   -p key=value          YAML 的 parameters 值（可重複；例：-p offline=false -p deployDryRun=true）
+#   --resource-ref <別名>=<分支>
+#                         指定 yaml resources.repositories 裡被引用 repo（以 repository: 別名）的分支（可重複；
+#                         例：--resource-ref core=UAT；不以 refs/ 開頭時補 refs/heads/）。self 請用 --branch
+#   --wait-build <建置 id> 不觸發，只輪詢這個建置到完成（失敗時一樣印出驗證訊息、失敗步驟與 log 末段）；
+#                         不能與 --pipeline、--branch、-p、--resource-ref、--no-wait 同時使用
 #   --no-wait             只觸發，不等結果
 #   --poll <秒>           輪詢間隔（預設 30）
 #   --timeout <分>        最多等幾分鐘（預設 180）；逾時不會取消建置，只是停止等待
@@ -22,6 +29,8 @@
 #
 # 常見用途：
 #   首次離線建置缺依賴 → ado-run.sh --pipeline "<名稱>" -p offline=false（踩坑 25、38）
+#   被引用 repo 用 UAT 試跑 → ado-run.sh --pipeline "<名稱>" --branch UAT --resource-ref core=UAT
+#   等推送自動觸發的建置 → ado-run.sh --wait-build <建置 id>
 #
 # 結束碼：0 成功；1 參數、設定或連線錯誤；2 建置失敗；3 建置被取消；4 等待逾時
 
@@ -35,6 +44,8 @@ CFG="$HERE/lib/ci_config.py"
 PIPELINE=""
 BRANCH=""
 PARAMS=()
+RES_REFS=()
+WAIT_BUILD=""
 WAIT=1
 POLL=30
 TIMEOUT_MIN=180
@@ -47,6 +58,8 @@ while [ $# -gt 0 ]; do
     --pipeline) PIPELINE="${2:-}"; shift 2 ;;
     --branch) BRANCH="${2:-}"; shift 2 ;;
     -p) PARAMS+=("${2:-}"); shift 2 ;;
+    --resource-ref) RES_REFS+=("${2:-}"); shift 2 ;;
+    --wait-build) WAIT_BUILD="${2:-}"; shift 2 ;;
     --no-wait) WAIT=0; shift ;;
     --poll) POLL="${2:-}"; shift 2 ;;
     --timeout) TIMEOUT_MIN="${2:-}"; shift 2 ;;
@@ -59,9 +72,22 @@ while [ $# -gt 0 ]; do
 done
 
 command -v python3 >/dev/null 2>&1 || { echo "錯誤：需要 python3" >&2; exit 1; }
-[ -n "$PIPELINE" ] || { echo "錯誤：--pipeline 必填" >&2; exit 1; }
+if [ -n "$WAIT_BUILD" ]; then
+  [[ "$WAIT_BUILD" =~ ^[0-9]+$ ]] || { echo "錯誤：--wait-build 要是數字建置 id" >&2; exit 1; }
+  if [ -n "$PIPELINE" ] || [ -n "$BRANCH" ] || [ "${#PARAMS[@]}" -gt 0 ] || [ "${#RES_REFS[@]}" -gt 0 ] || [ "$WAIT" -eq 0 ]; then
+    echo "錯誤：--wait-build 不觸發建置，不能與 --pipeline、--branch、-p、--resource-ref、--no-wait 同時使用" >&2; exit 1
+  fi
+else
+  [ -n "$PIPELINE" ] || { echo "錯誤：--pipeline 必填" >&2; exit 1; }
+fi
 for kv in ${PARAMS[@]+"${PARAMS[@]}"}; do
   [[ "$kv" == *=* ]] || { echo "錯誤：-p 要寫成 key=value：$kv" >&2; exit 1; }
+done
+for kv in ${RES_REFS[@]+"${RES_REFS[@]}"}; do
+  [[ "$kv" =~ ^[A-Za-z_][A-Za-z0-9_]*=.+$ ]] || { echo "錯誤：--resource-ref 要寫成 <別名>=<分支>：$kv" >&2; exit 1; }
+  if [ "${kv%%=*}" = self ]; then echo "錯誤：self 的分支請用 --branch，不要用 --resource-ref" >&2; exit 1; fi
+  if [[ " ${SEEN_ALIAS:-} " == *" ${kv%%=*} "* ]]; then echo "錯誤：--resource-ref 的別名「${kv%%=*}」重複指定" >&2; exit 1; fi
+  SEEN_ALIAS="${SEEN_ALIAS:-} ${kv%%=*}"
 done
 [[ "$POLL" =~ ^[0-9]+$ ]] || { echo "錯誤：--poll 要是整數秒" >&2; exit 1; }
 [[ "$TIMEOUT_MIN" =~ ^[0-9]+$ ]] || { echo "錯誤：--timeout 要是整數分鐘" >&2; exit 1; }
@@ -105,6 +131,10 @@ http_fail() {
 
 json() { python3 -c "import json,sys; d=json.load(open(sys.argv[1], encoding='utf-8')); $1" "$RESP"; }
 
+if [ -n "$WAIT_BUILD" ]; then
+  RUN_ID="$WAIT_BUILD"
+  echo "不觸發，只等待建置 ${RUN_ID}"
+else
 # ---------------------------------------------------------------- 1. pipeline 名稱 → id
 if [[ "$PIPELINE" =~ ^[0-9]+$ ]]; then
   PID="$PIPELINE"
@@ -121,13 +151,23 @@ else
 fi
 
 # ---------------------------------------------------------------- 2. 觸發
-python3 - "$WORK/run.json" "$BRANCH" ${PARAMS[@]+"${PARAMS[@]}"} <<'PY'
+# 參數列：輸出檔、分支、-p 的個數、-p 的值…、--resource-ref 的值…
+python3 - "$WORK/run.json" "$BRANCH" "${#PARAMS[@]}" ${PARAMS[@]+"${PARAMS[@]}"} ${RES_REFS[@]+"${RES_REFS[@]}"} <<'PY'
 import json, sys
-out, branch, kvs = sys.argv[1], sys.argv[2], sys.argv[3:]
+out, branch, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+kvs, refs = sys.argv[4:4 + n], sys.argv[4 + n:]
+
+def full(ref):
+    return ref if ref.startswith("refs/") else "refs/heads/" + ref
+
 body = {}
 if branch:
-    ref = branch if branch.startswith("refs/") else "refs/heads/" + branch
-    body["resources"] = {"repositories": {"self": {"refName": ref}}}
+    body["resources"] = {"repositories": {"self": {"refName": full(branch)}}}
+if refs:
+    repos = body.setdefault("resources", {"repositories": {}})["repositories"]
+    for kv in refs:
+        alias, ref = kv.split("=", 1)
+        repos[alias] = {"refName": full(ref)}
 if kvs:
     body["templateParameters"] = dict(kv.split("=", 1) for kv in kvs)
 json.dump(body, open(out, "w", encoding="utf-8"), ensure_ascii=False)
@@ -140,6 +180,7 @@ RUN_NAME="$(json "print(d.get('name',''))")"
 echo "已觸發：run ${RUN_ID}（${RUN_NAME}）參數：$(cat "$WORK/run.json")"
 
 if [ "$WAIT" -eq 0 ]; then exit 0; fi
+fi
 
 # ---------------------------------------------------------------- 3. 輪詢
 deadline=$(( $(date +%s) + TIMEOUT_MIN * 60 ))

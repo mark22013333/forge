@@ -9,7 +9,8 @@
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-DISC="$HERE/../scripts/ci-discover.sh"
+# CI_DISCOVER 可指向別的版本（例如修改前的腳本），用來做正對照：新案例在舊版上應該失敗
+DISC="${CI_DISCOVER:-$HERE/../scripts/ci-discover.sh}"
 T="$(mktemp -d)"
 echo "暫存目錄：$T"
 
@@ -174,6 +175,148 @@ bash "$DISC" --bogus >/dev/null 2>&1; RC=$?
 check "未知參數 → exit 1" '[ $RC -eq 1 ]'
 bash "$DISC" --project-dir "$T/nope" >/dev/null 2>&1; RC=$?
 check "專案目錄不存在 → exit 1" '[ $RC -eq 1 ]'
+
+echo "== 情境 7：測試外部連線（連線字串、註解剝除、不印帳密、Spring context 測試類）"
+JP="$T/jproj"
+mkdir -p "$JP/.git" "$JP/src/main/resources" "$JP/src/test/resources" "$JP/src/test/java/a"
+cat >| "$T/cfg/same.yml" <<'EOF'
+servers:
+  lab-ado:
+    url: http://10.9.8.7:8080
+    collection: Coll
+    pat_env: FAKE_ADO_TOKEN
+EOF
+# 第 1 行是被 # 註解掉的舊設定；第 2 行與 ADO server 同機且帶帳密；h2:mem 是記憶體庫
+cat >| "$JP/src/main/resources/jdbc-test.properties" <<'EOF'
+# jdbc.url=jdbc:sqlserver://10.0.0.99:1433;databaseName=old
+jdbc.url=jdbc:sqlserver://10.9.8.7:1433;databaseName=dbNAMEx;user=sa;password=pwSECRET1
+local.url=jdbc:mariadb://localhost:3306/UnitTest
+mem.url=jdbc:h2:mem:testdb;MODE=MySQL
+; ini.url=jdbc:mysql://10.0.0.95:3306/semicolon
+user.url=jdbc:mysql://bobUSER:pwSECRET2@192.0.2.10:3306/db
+esc.url=jdbc\:mysql\://10.9.8.8\:3306/escaped
+EOF
+# 帳密含各種特殊字元：輸出不得出現帳號（dbuser、guest、usrQ*）或密碼（4321、gu)est、pwZ*）的任何片段
+cat >| "$JP/src/test/resources/leak.properties" <<'EOF'
+a=jdbc:mysql://dbuser:4321?x@h1.corp.invalid:3306/db
+b=amqp://guest:gu)est@mq.corp.invalid
+c=jdbc:mysql://usrQ1:pwZ@pwZ@h3.corp.invalid:3306/db
+d=jdbc:mysql://usrQ2:pwZ:pwZ@h4.corp.invalid/db
+e=jdbc:mysql://usrQ3:pwZ/pwZ@h5.corp.invalid/db
+f=jdbc:mysql://usrQ4:pwZ#pwZ@h6.corp.invalid/db
+g=jdbc:mysql://usrQ5:pwZ?pwZ@h7.corp.invalid/db
+h=jdbc:mysql://usrQ6:pwZ pwZ@h8.corp.invalid/db
+i=jdbc:mysql://usrQ7:pwZ"pwZ@h9.corp.invalid/db
+j=jdbc:mysql://usrQ8:pwZ'pwZ@h10.corp.invalid/db
+k=jdbc:oracle:thin:usrQ9/pwZ@pwZ@h11.corp.invalid:1521:sid
+l=jdbc:oracle:thin:usrQ10/pwZ pwZ@h12.corp.invalid:1521:sid
+m=jdbc:sqlserver://h13.corp.invalid:1433;user=usrQ11;password=pwZ@pwZ
+n=mongodb://usrQ12:pwZ;pwZ@h14.corp.invalid:27017/db
+o=jdbc:mysql://usrQ13:pwZ,pwZ@h15.corp.invalid/db
+EOF
+# 不在掃描範圍：main 底下、檔名不含 test
+echo 'jdbc.url=jdbc:mysql://10.0.0.96:3306/prod' >| "$JP/src/main/resources/application.properties"
+cat >| "$JP/src/test/resources/hibernate.cfg.xml" <<'EOF'
+<hibernate-configuration>
+<!--
+<property name="connection.url">jdbc:mysql://10.0.0.98:3306/commented</property>
+-->
+<property name="connection.url">jdbc:mysql://db.example.test:3306/real</property>
+</hibernate-configuration>
+EOF
+cat >| "$JP/src/test/java/a/LiveTest.java" <<'EOF'
+package a;
+
+import org.junit.Ignore;
+import org.junit.runner.RunWith;
+
+@RunWith(SpringJUnit4ClassRunner.class)
+@ContextConfiguration(classes = AppConfig.class)
+public class LiveTest {
+    // String old = "jdbc:mysql://10.0.0.97:3306/x";
+    /* String older = "jdbc:mysql://10.0.0.94:3306/x"; */
+    String url = "jdbc:postgresql://127.0.0.1:5432/x";
+    @Ignore
+    public void skipped() {}
+}
+EOF
+cat >| "$JP/src/test/java/a/IgnoredTest.java" <<'EOF'
+package a;
+
+@Ignore("連真實環境")
+@ContextConfiguration(classes = AppConfig.class)
+public class IgnoredTest {
+}
+EOF
+cat >| "$JP/src/test/java/a/DisabledTest.java" <<'EOF'
+package a;
+
+@Disabled
+@SpringBootTest
+class DisabledTest {
+}
+EOF
+# 只有 import、註解被註解掉 → 不會啟動 Spring context
+cat >| "$JP/src/test/java/a/ImportOnlyTest.java" <<'EOF'
+package a;
+
+import org.springframework.test.context.junit4.SpringJUnit4ClassRunner;
+//@RunWith(SpringJUnit4ClassRunner.class)
+public class ImportOnlyTest {
+}
+EOF
+SNAP_JP() { (cd "$T" && find jproj -exec stat -f '%N %m %z' {} + | sort); }
+BEFORE="$(SNAP_JP)"
+OUT="$(bash "$DISC" --project-dir "$JP" --servers "$T/cfg/same.yml" --ssh-dir "$T/emptyssh" --no-network 2>&1)"; RC=$?
+show "$(printf '%s\n' "$OUT" | sed -n '/== 測試外部連線/,/== 跨 repo/p')"
+check "exit 0" '[ $RC -eq 0 ]'
+check "與 servers.yml 主機同機的 jdbc → 標「同機」（含檔案:行號）" 'printf "%s\n" "$OUT" | grep -q "src/main/resources/jdbc-test.properties:2  jdbc:sqlserver://10.9.8.7:1433  ← ⚠️ 與 ADO server 同機"'
+check "localhost → 標「agent 本機」" 'printf "%s\n" "$OUT" | grep -q "jdbc:mariadb://localhost:3306  ← CI 上會連到 agent 本機"'
+check "Java 字串裡的 127.0.0.1 → 標「agent 本機」" 'printf "%s\n" "$OUT" | grep -q "LiveTest.java:11  jdbc:postgresql://127.0.0.1:5432  ← CI 上會連到 agent 本機"'
+check "XML 註解外的設定照列" 'printf "%s\n" "$OUT" | grep -q "hibernate.cfg.xml:5  jdbc:mysql://db.example.test:3306"'
+check "h2:mem → 不列" '! printf "%s\n" "$OUT" | grep -q "h2"'
+check "被 # 註解的 jdbc 行 → 不列" '! printf "%s\n" "$OUT" | grep -q "10.0.0.99"'
+check "被 ; 註解的 jdbc 行 → 不列" '! printf "%s\n" "$OUT" | grep -q "10.0.0.95"'
+check "XML 註解區塊內 → 不列" '! printf "%s\n" "$OUT" | grep -q "10.0.0.98"'
+check "Java // 與 /* */ 註解內 → 不列" '! printf "%s\n" "$OUT" | grep -q "10.0.0.97" && ! printf "%s\n" "$OUT" | grep -q "10.0.0.94"'
+check "main 底下檔名不含 test 的設定檔 → 不在掃描範圍" '! printf "%s\n" "$OUT" | grep -q "10.0.0.96"'
+check "帶帳密的連線字串只列主機與埠" 'printf "%s\n" "$OUT" | grep -q "jdbc:mysql://192.0.2.10:3306  ← 外部主機"'
+check "輸出不含密碼、帳號與其餘參數" '! printf "%s\n" "$OUT" | grep -Eq "pwSECRET|bobUSER|dbNAMEx|password|user="'
+check "帳密含 ? ) : / # @ 空白 引號 , ; 時，輸出不含帳號或密碼的任何片段" '! printf "%s\n" "$OUT" | grep -Eq "dbuser|4321|guest|gu\)|usrQ|pwZ"'
+check "leak.properties 15 行全部列出（沒有因為特殊字元而整行消失）" '[ "$(printf "%s\n" "$OUT" | grep -c "leak.properties:")" -eq 15 ]'
+check "無法確定帳密邊界時印「<無法解析>」" 'printf "%s\n" "$OUT" | grep -q "leak.properties:1  jdbc:mysql://<無法解析>" && printf "%s\n" "$OUT" | grep -q "leak.properties:2  amqp://<無法解析>" && printf "%s\n" "$OUT" | grep -q "leak.properties:5  jdbc:mysql://<無法解析>"'
+check "密碼含 @、: 時以最後一個 @ 切掉帳密" 'printf "%s\n" "$OUT" | grep -q "leak.properties:3  jdbc:mysql://h3.corp.invalid:3306" && printf "%s\n" "$OUT" | grep -q "leak.properties:4  jdbc:mysql://h4.corp.invalid  "'
+check "oracle 密碼含空白仍取到主機" 'printf "%s\n" "$OUT" | grep -q "leak.properties:12  jdbc:oracle:thin:@h12.corp.invalid:1521"'
+check "Java .properties 跳脫寫法（\\: ）也抓得到" 'printf "%s\n" "$OUT" | grep -q "jdbc-test.properties:7  jdbc:mysql://10.9.8.8:3306  ← 外部主機"'
+check "@ContextConfiguration 且類別上無 @Ignore → 列出" 'printf "%s\n" "$OUT" | grep -q "src/test/java/a/LiveTest.java:6  LiveTest  ← 會啟動 Spring context"'
+check "類別上有 @Ignore → 不列" '! printf "%s\n" "$OUT" | grep -q "IgnoredTest"'
+check "類別上有 @Disabled → 不列" '! printf "%s\n" "$OUT" | grep -q "DisabledTest"'
+check "只有 import、Spring 註解被註解掉 → 不列" '! printf "%s\n" "$OUT" | grep -q "ImportOnlyTest"'
+check "段末建議先只建置" 'printf "%s\n" "$OUT" | grep -q "建議：第一次建 CI 建議先只建置（-DskipTests／gradle assemble）"'
+check "沒有寫入或修改任何檔案" '[ "$BEFORE" = "$(SNAP_JP)" ]'
+OUT="$(bash "$DISC" --project-dir "$JP" --servers "$T/none.yml" --ssh-dir "$T/emptyssh" --no-network 2>&1)"
+check "沒有 servers.yml 時同一個主機不標「同機」" 'printf "%s\n" "$OUT" | grep -q "jdbc:sqlserver://10.9.8.7:1433  ← 外部主機" && ! printf "%s\n" "$OUT" | grep -q "同機"'
+
+echo "== 情境 8：跨 repo 相對引用"
+FP="$T/frontrepo"
+mkdir -p "$FP/.git" "$FP/web/src/components/Doc" "$FP/web/src/util" "$FP/web/node_modules/pkg"
+cat >| "$FP/web/src/components/Doc/Doc.stories.js" <<'EOF'
+import React from "react";
+import "../../../../../Other/src";
+import helper from "../../util";
+// import "../../../../../Commented/src";
+EOF
+echo '@import "../../../../../Shared/vars";' >| "$FP/web/src/components/Doc/doc.scss"
+echo 'require("../../../../Leak/x");' >| "$FP/web/node_modules/pkg/index.js"
+OUT="$(bash "$DISC" --project-dir "$FP" --servers "$T/none.yml" --ssh-dir "$T/emptyssh" --no-network 2>&1)"; RC=$?
+show "$(printf '%s\n' "$OUT" | sed -n '/== 跨 repo/,/== 其他專案/p')"
+check "exit 0" '[ $RC -eq 0 ]'
+check "stories 檔 import 跳出 repo 根 → 列出（檔案:行號＋解析後目標）" 'printf "%s\n" "$OUT" | grep -Fq "web/src/components/Doc/Doc.stories.js:2  \"../../../../../Other/src\" → $T/Other/src（repo 外的 Other）"'
+check "scss @import 跳出 repo 根 → 列出" 'printf "%s\n" "$OUT" | grep -q "doc.scss:1  \"../../../../../Shared/vars\""'
+check "未跳出 repo 根 → 不列" '! printf "%s\n" "$OUT" | grep -q "\"../../util\""'
+check "註解掉的 import → 不列" '! printf "%s\n" "$OUT" | grep -q "Commented"'
+check "node_modules 不掃" '! printf "%s\n" "$OUT" | grep -q "Leak"'
+check "提示並排 checkout" 'printf "%s\n" "$OUT" | grep -q "CI 需並排 checkout 該 repo（resources.repositories）"'
 
 echo
 echo "結果：通過 ${PASS}、失敗 ${FAIL}"

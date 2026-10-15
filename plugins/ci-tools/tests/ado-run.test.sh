@@ -197,6 +197,63 @@ check "以上都沒有發出請求" '[ ! -s "$FAKE_LOG" ]'
 OUT="$(cd "$T" && EX_PAT="" bash "$RUN" --servers "$T/servers.yml" --pipeline 7 2>&1)"; RC=$?
 check "權杖環境變數未設定 → exit 1" '[ $RC -eq 1 ] && echo "$OUT" | grep -q "EX_PAT 未設定"'
 
+# ---------------------------------------------------------------- 情境 9～10：--resource-ref、--wait-build
+scenario "情境 9a：沒帶新參數時 body 與原本完全相同" "$R_PIPES" "$R_RUN" $'GET\t/build/builds/101?\t200\tb-ok.json'
+bash "$RUN" "${args[@]}" --pipeline "app CI" --branch main -p offline=false >/dev/null 2>&1; RC=$?
+BODY="$(grep "^POST" "$FAKE_LOG" | cut -f3)"
+check "exit 0，body 只有 self 與 templateParameters（逐鍵相等）" '[ $RC -eq 0 ] && echo "$BODY" | python3 -c "import json,sys; assert json.load(sys.stdin)=={\"resources\":{\"repositories\":{\"self\":{\"refName\":\"refs/heads/main\"}}},\"templateParameters\":{\"offline\":\"false\"}}"'
+check "請求順序：查清單 → 觸發 → 查建置" '[ "$(cut -f1,2 "$FAKE_LOG" | sed "s/?.*//" | paste -sd" " -)" = "GET	http://ado.example:8080/Coll/proj-x/_apis/pipelines POST	http://ado.example:8080/Coll/proj-x/_apis/pipelines/7/runs GET	http://ado.example:8080/Coll/proj-x/_apis/build/builds/101" ]'
+scenario "情境 9a2：不帶分支也不帶參數 → body 是空物件" "$R_RUN"
+bash "$RUN" "${args[@]}" --pipeline 7 --no-wait >/dev/null 2>&1; RC=$?
+check "exit 0 且 body 為 {}" '[ $RC -eq 0 ] && [ "$(grep "^POST" "$FAKE_LOG" | cut -f3)" = "{}" ]'
+
+scenario "情境 9b：--resource-ref 指定被引用 repo 的分支" "$R_RUN" $'GET\t/build/builds/101?\t200\tb-ok.json'
+OUT="$(bash "$RUN" "${args[@]}" --pipeline 7 --branch main --resource-ref core=UAT --resource-ref tools=refs/heads/dev -p offline=false 2>&1)"; RC=$?
+echo "$OUT" | sed 's/^/    | /'
+BODY="$(grep "^POST" "$FAKE_LOG" | cut -f3)"
+check "exit 0 並 POST 到 pipelines/7/runs" '[ $RC -eq 0 ] && grep -q "^POST	http://ado.example:8080/Coll/proj-x/_apis/pipelines/7/runs?api-version=6.0-preview.1	" "$FAKE_LOG"'
+check "body：self 與兩個別名的 refName（UAT 補成 refs/heads/UAT）＋ templateParameters" 'echo "$BODY" | python3 -c "import json,sys; assert json.load(sys.stdin)=={\"resources\":{\"repositories\":{\"self\":{\"refName\":\"refs/heads/main\"},\"core\":{\"refName\":\"refs/heads/UAT\"},\"tools\":{\"refName\":\"refs/heads/dev\"}}},\"templateParameters\":{\"offline\":\"false\"}}"'
+
+scenario "情境 9c：只給 --resource-ref、不給 --branch → 不帶 self" "$R_RUN"
+bash "$RUN" "${args[@]}" --pipeline 7 --resource-ref core=UAT --no-wait >/dev/null 2>&1; RC=$?
+check "exit 0 且 body 只有 core" '[ $RC -eq 0 ] && grep "^POST" "$FAKE_LOG" | cut -f3 | python3 -c "import json,sys; assert json.load(sys.stdin)=={\"resources\":{\"repositories\":{\"core\":{\"refName\":\"refs/heads/UAT\"}}}}"'
+
+scenario "情境 9d：--resource-ref 格式錯誤不發請求"
+bash "$RUN" "${args[@]}" --pipeline 7 --resource-ref noequals >/dev/null 2>&1; RC1=$?
+OUT="$(bash "$RUN" "${args[@]}" --pipeline 7 --resource-ref self=main 2>&1)"; RC2=$?
+check "沒有 = → exit 1；self 要用 --branch → exit 1；都沒有發出請求" '[ $RC1 -eq 1 ] && [ $RC2 -eq 1 ] && echo "$OUT" | grep -q "self 的分支請用 --branch" && [ ! -s "$FAKE_LOG" ]'
+
+scenario "情境 9e：同一別名重複指定 --resource-ref → 報錯、不發請求"
+OUT="$(bash "$RUN" "${args[@]}" --pipeline 7 --resource-ref core=A --resource-ref core=B 2>&1)"; RC=$?
+check "exit 1、說明別名重複、沒有發出請求" '[ $RC -eq 1 ] && echo "$OUT" | grep -q "別名「core」重複指定" && [ ! -s "$FAKE_LOG" ]'
+scenario "情境 9f：不同別名（其中一個是另一個的前綴）不算重複" "$R_RUN"
+bash "$RUN" "${args[@]}" --pipeline 7 --resource-ref core=A --resource-ref core2=B --no-wait >/dev/null 2>&1; RC=$?
+check "exit 0 且兩個別名都在 body" '[ $RC -eq 0 ] && grep "^POST" "$FAKE_LOG" | cut -f3 | python3 -c "import json,sys; r=json.load(sys.stdin)[\"resources\"][\"repositories\"]; assert r=={\"core\":{\"refName\":\"refs/heads/A\"},\"core2\":{\"refName\":\"refs/heads/B\"}}"'
+
+echo '{"id":555,"status":"completed","result":"failed"}' >| "$T/r/b555-fail.json"
+echo '{"id":555,"status":"inProgress"}' >| "$T/r/b555-progress.json"
+echo '{"id":555,"status":"completed","result":"succeeded"}' >| "$T/r/b555-ok.json"
+scenario "情境 10a：--wait-build 不觸發，只輪詢，失敗時沿用失敗輸出" \
+  $'GET\t/build/builds/555?\t200\tb555-progress.json,b555-fail.json' \
+  $'GET\t/builds/555/timeline\t200\ttimeline.json' \
+  $'GET\t/builds/555/logs/5\t200\tlog5.txt'
+OUT="$(bash "$RUN" "${args[@]}" --wait-build 555 2>&1)"; RC=$?
+echo "$OUT" | sed 's/^/    | /'
+check "exit 2" '[ $RC -eq 2 ]'
+check "沒有 POST、沒有查 pipeline 清單" '! grep -q "^POST" "$FAKE_LOG" && ! grep -q "/_apis/pipelines" "$FAKE_LOG"'
+check "輪詢建置 555 兩次" '[ "$(grep -c "^GET	.*/build/builds/555?" "$FAKE_LOG")" -eq 2 ]'
+check "印出失敗步驟與 log 末段" 'echo "$OUT" | grep -q "failed 的步驟：Gradle 建置（log 5）" && echo "$OUT" | grep -q "ERROR-LINE-XYZ" && echo "$OUT" | grep -q "結果：failed（run 555）"'
+
+scenario "情境 10b：--wait-build 成功 → exit 0" $'GET\t/build/builds/555?\t200\tb555-ok.json'
+OUT="$(bash "$RUN" "${args[@]}" --wait-build 555 2>&1)"; RC=$?
+check "exit 0 並印出成功" '[ $RC -eq 0 ] && echo "$OUT" | grep -q "結果：成功（run 555）" && [ "$(wc -l < "$FAKE_LOG")" -eq 1 ]'
+
+scenario "情境 10c：--wait-build 參數錯誤不發請求"
+bash "$RUN" "${args[@]}" --wait-build abc >/dev/null 2>&1; RC1=$?
+bash "$RUN" "${args[@]}" --wait-build 555 --pipeline 7 >/dev/null 2>&1; RC2=$?
+bash "$RUN" "${args[@]}" --wait-build 555 --no-wait >/dev/null 2>&1; RC3=$?
+check "非數字、與 --pipeline 或 --no-wait 並用都 exit 1，且沒有發出請求" '[ $RC1 -eq 1 ] && [ $RC2 -eq 1 ] && [ $RC3 -eq 1 ] && [ ! -s "$FAKE_LOG" ]'
+
 echo
 echo "結果：通過 ${PASS}、失敗 ${FAIL}"
 [ "$FAIL" -eq 0 ]

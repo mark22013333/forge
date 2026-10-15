@@ -75,6 +75,29 @@ if [ -z "$WORKDIR" ]; then
 fi
 echo "工作 clone：$WORKDIR"
 
+# 既有工作 clone 的遠端若與本次不同，代表路徑撞名（例：兩個專案的 repo 都叫 product），
+# 直接中止、不覆蓋，否則會把另一個專案的鏡像靜默改指到這裡
+# 網址印出前遮掉 //帳號[:密碼]@（https 網址可能嵌了 PAT）
+mask_url() { printf '%s\n' "$1" | sed 's#//[^/@]*@#//***@#'; }
+if [ -f "$WORKDIR/config" ]; then
+  CONFLICT=0
+  for r in gitea ado; do
+    url="$GITEA"; [ "$r" = ado ] && url="$ADO"
+    # 用 config 讀原始值：remote get-url 會套用 url.<x>.insteadOf 改寫，同一 repo 也會被誤判為不同
+    old="$(git --git-dir="$WORKDIR" config --get "remote.$r.url" 2>/dev/null || true)"
+    if [ -n "$old" ] && [ "$old" != "$url" ]; then
+      [ "$CONFLICT" -eq 0 ] && echo "錯誤：工作 clone 已存在，且遠端網址與本次不同（可能與其他專案撞名），未做任何修改：" >&2
+      echo "  $r 既有：$(mask_url "$old")" >&2
+      echo "  $r 本次：$(mask_url "$url")" >&2
+      CONFLICT=1
+    fi
+  done
+  if [ "$CONFLICT" -eq 1 ]; then
+    echo "請改用 --workdir 指定這個 repo 專用的工作 clone 路徑。" >&2
+    exit 1
+  fi
+fi
+
 mkdir -p "$WORKDIR"
 # 重跑 init 是安全的：若 HEAD／config 被清掉會補回，既有 objects 與 refs 不受影響
 git init -q --bare "$WORKDIR"
@@ -82,9 +105,8 @@ G() { git --git-dir="$WORKDIR" "$@"; }
 
 for r in gitea ado; do
   url="$GITEA"; [ "$r" = ado ] && url="$ADO"
-  if G remote get-url "$r" >/dev/null 2>&1; then
-    G remote set-url "$r" "$url"
-  else
+  # 網址不同的情況已在上方擋下，這裡只會遇到「相同」或「尚未設定」
+  if ! G config --get "remote.$r.url" >/dev/null 2>&1; then
     G remote add "$r" "$url"
   fi
 done
@@ -174,7 +196,8 @@ if [ -s "$TMP/manual" ]; then
   echo
   echo "以下為保護分支，腳本不代推，請確認後自行執行："
   while read -r b sha; do
-    echo "  ${SSH_PREFIX}git --git-dir=\"$WORKDIR\" push ado $sha:refs/heads/$b"
+    # 路徑與分支名用 %q 跳脫：這行會被 sync-all-repos.sh 寫進可執行檔，含 $ 或反引號時不可被展開
+    echo "  ${SSH_PREFIX}git --git-dir=$(printf '%q' "$WORKDIR") push ado $(printf '%q' "$sha:refs/heads/$b")"
   done < "$TMP/manual"
 fi
 

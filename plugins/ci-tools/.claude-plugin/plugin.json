@@ -1,7 +1,7 @@
 {
   "name": "ci-tools",
   "description": "CI 導入工具集 — 引導自架 Azure DevOps Server 接上既有 Gitea 專案的 CI：先探索既有設定、兩層設定檔（server／專案）、建立 ADO 專案與 repo、pipeline 範本、測試隔離 init script、首次建置失敗分類、Gitea → ADO 單向快轉同步（含多 repo）腳本與踩坑表；觸發／授權 pipeline、接上新 server 時一次備好 ADO 專案（repo、預設分支、pipeline、授權）的輔助腳本，以及 Windows agent 經 SSH 部署到 VM 的 CD 範本",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "author": {
     "name": "Cheng"
   },
